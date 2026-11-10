@@ -1,0 +1,13 @@
+[package]
+name = "fishing-platform-windows"
+version = "0.1.0"
+edition.workspace = true
+description = "Windows platform layer: screen capture, key/mouse injection, process lookup"
+
+[dependencies]
+fishing-core.workspace = true
+image.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+windows.workspace = true

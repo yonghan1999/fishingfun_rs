@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>Google Chrome</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 主网格：行 Auto/*，列 70% / 30%（右列 min 300px） -->
+  <div id="root">
+    <!-- 左侧：截图预览区（跨两行，黑色背景 DockPanel 等价） -->
+    <div id="previewArea">
+      <div id="previewInner">
+        <img id="screenshot" src="assets/FishingFun.png" alt="" />
+        <!-- Looting 重影文字（白层 + 红层错位） -->
+        <div id="lootingOverlay" class="hidden">
+          <div class="loot-text loot-white">拾取中...</div>
+          <div class="loot-text loot-red">拾取中...</div>
+        </div>
+      </div>
+      <!-- 飞鱼动画层（ZIndex 100） -->
+      <div id="fishLayer"></div>
+    </div>
+
+    <!-- 右上：工具按钮卡 -->
+    <div class="card" id="toolbarCard">
+      <button id="btnPlay" class="tool-btn" title="开始">
+        <img id="playImg" src="assets/play.png" alt="Start" />
+        <img id="playImgDisabled" src="assets/play_disabled.png" alt="" class="hidden" />
+      </button>
+      <button id="btnStop" class="tool-btn" title="停止" disabled>
+        <img id="stopImg" src="assets/stop.png" alt="Stop" class="hidden" />
+        <img id="stopImgDisabled" src="assets/stop_disabled.png" alt="" />
+      </button>
+      <button id="btnSettings" class="tool-btn" title="颜色设置">
+        <img src="assets/settings.png" alt="Settings" />
+      </button>
+      <button id="btnCastKey" class="tool-btn" title="抛竿按键 - 点击修改">
+        <img src="assets/Button.png" alt="" class="castkey-bg" />
+        <input id="castKeyInput" maxlength="1" value="4" autocomplete="off" />
+      </button>
+    </div>
+
+    <!-- 右下：图表 Flipper + 日志 Flipper -->
+    <div id="cardGrid">
+      <!-- Flipper 1：振幅图表 -->
+      <div class="flipper" id="graphFlipper">
+        <div class="flipper-inner">
+          <div class="flipper-face flipper-front card">
+            <button class="flipper-header" data-flip="graphFlipper">
+              <svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"/></svg>
+              <span>浮漂振幅图表</span>
+            </button>
+            <canvas id="chartCanvas"></canvas>
+          </div>
+          <div class="flipper-face flipper-back card">
+            <button class="show-btn" data-flip="graphFlipper">显示图表</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Flipper 2：日志 -->
+      <div class="flipper" id="logFlipper">
+        <div class="flipper-inner">
+          <div class="flipper-face flipper-front card">
+            <button class="flipper-header" data-flip="logFlipper">
+              <svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"/></svg>
+              <span>日志</span>
+            </button>
+            <div id="logList"></div>
+          </div>
+          <div class="flipper-face flipper-back card">
+            <button class="show-btn" data-flip="logFlipper">显示日志</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="chart.js"></script>
+  <script src="fish.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

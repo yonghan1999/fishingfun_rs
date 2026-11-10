@@ -1,0 +1,122 @@
+/* Colour Explorer — ColourConfiguration.xaml 复刻（规格 docs/07 §8） */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%; height: 100%;
+  background: #fff;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+}
+
+/* 行比例为 star/Auto，列比例 41:91:132 ≈ 15.5%/34.5%/50% */
+#root {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  grid-template-columns: 41fr 91fr 132fr;
+  width: 100%; height: 100%;
+}
+
+#leftPane {
+  grid-column: 1 / 3;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto 1fr;
+  min-height: 0;
+}
+#cubeLeft {
+  grid-row: 1 / 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 4px;
+}
+#colourLabel { font-weight: normal; }
+#labelRed { margin-top: 2px; }
+
+/* 垂直滑条（accent-color 近似原版蓝色前景） */
+#findColour {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  flex: 1;
+  margin-left: 5px;
+  accent-color: #2196F3;
+}
+
+#cubeCanvas {
+  grid-column: 2;
+  grid-row: 1 / 4;
+  width: 100%; height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+#wowCanvas, #wowPlaceholder {
+  grid-column: 3;
+  grid-row: 1;
+  width: 100%; height: 100%;
+  object-fit: contain;
+  margin: 0 5px;
+  background: #000;
+}
+#wowCanvas { display: none; }
+
+#bottomLeft {
+  grid-column: 1 / 3;
+  grid-row: 2;
+  margin: 5px 0 0 5px;
+  display: flex;
+  flex-direction: column;
+}
+.slider-block { display: flex; flex-direction: column; }
+.slider-text { font-size: 13px; overflow-wrap: break-word; }
+.slider-block input[type="range"] {
+  margin: 0 0 10px 20px;
+  accent-color: #2196F3;
+}
+
+#bottomRight {
+  grid-column: 3;
+  grid-row: 2;
+  display: grid;
+  grid-template-rows: 50px 40px 26px 26px;
+  justify-items: center;
+}
+#btnCapture { width: 150px; height: 30px; margin-top: 10px; cursor: pointer; }
+#bottomRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+#cmbColors { width: 100px; }
+#lootDelay { width: 100px; accent-color: #2196F3; }
+
+/* 点击取色 */
+#wowCanvas { cursor: crosshair; }
+#pickRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #555;
+}
+#pickSwatch {
+  width: 16px; height: 16px;
+  border: 1px solid #888;
+  flex: none;
+}
+
+/* 搜索区域框选（F3） */
+#regionRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #555;
+}
+#regionRow button {
+  font-size: 12px;
+  padding: 1px 8px;
+  cursor: pointer;
+}

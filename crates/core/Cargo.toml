@@ -1,0 +1,12 @@
+[package]
+name = "fishing-core"
+version = "0.1.0"
+edition.workspace = true
+description = "FishingFun core bot logic (platform independent)"
+
+[dependencies]
+image.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }

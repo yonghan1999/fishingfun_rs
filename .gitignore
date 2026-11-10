@@ -1,0 +1,10 @@
+# Rust 构建产物
+/target
+
+# 冒烟测试截图等本地产物
+gui-smoke.png
+
+# 运行时持久化配置（用户本机按键/阈值/区域，不入库）
+keybind.txt
+strikevalue.txt
+searchregion.txt

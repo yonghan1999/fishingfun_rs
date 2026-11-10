@@ -1,0 +1,17 @@
+[package]
+name = "fishing-console"
+version = "0.1.0"
+edition.workspace = true
+description = "FishingFun console front-end"
+
+[[bin]]
+name = "fishing-console"
+path = "src/main.rs"
+
+[dependencies]
+fishing-core.workspace = true
+fishing-platform-windows.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

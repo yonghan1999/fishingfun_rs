@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>颜色配置</title>
+  <link rel="stylesheet" href="colour.css" />
+</head>
+<body>
+  <!-- Grid：行 star/Auto，列 41:91:132 -->
+  <div id="root">
+    <!-- 左：色值标签 + 垂直滑条 + 颜色立方图 -->
+    <div id="leftPane">
+      <div id="cubeLeft">
+        <div id="colourLabel">红色:</div>
+        <div id="labelRed">100</div>
+        <input id="findColour" type="range" min="0" max="255" value="100" orient="vertical" />
+      </div>
+      <canvas id="cubeCanvas" width="256" height="256"></canvas>
+    </div>
+
+    <!-- 右：WoW 截图（匹配像素高亮；单击取色，拖拽框选搜索区域） -->
+    <canvas id="wowCanvas" title="单击取色；按住拖拽框选水面搜索区域"></canvas>
+    <img id="wowPlaceholder" src="assets/FishingFun.png" alt="" />
+
+    <!-- 底部左：乘数滑条 × 2 + 咬钩判定 -->
+    <div id="bottomLeft">
+      <div class="slider-block">
+        <div id="labelColourMultiplier" class="slider-text">Label goes here</div>
+        <input id="colourMultiplier" type="range" min="0" max="300" value="50" />
+      </div>
+      <div class="slider-block">
+        <div id="labelColourClosenessMultiplier" class="slider-text">Label goes here</div>
+        <input id="colourClosenessMultiplier" type="range" min="0" max="500" value="200" />
+      </div>
+      <div class="slider-block">
+        <div id="labelStrike" class="slider-text">咬钩判定：浮漂下沉 7 像素时提竿</div>
+        <input id="strikeValue" type="range" min="1" max="30" value="7" />
+      </div>
+    </div>
+
+    <!-- 底部右：Capture + Watch Feather + Loot Delay + 取色显示 -->
+    <div id="bottomRight">
+      <button id="btnCapture">截取屏幕</button>
+      <div id="bottomRow">
+        <label>追踪羽毛:</label>
+        <select id="cmbColors">
+          <option value="Blue">🟦 蓝色</option>
+          <option value="Red" selected>🟥 红色</option>
+        </select>
+        <label>拾取延迟:</label>
+        <input id="lootDelay" type="range" min="0" max="3500" value="2000" />
+      </div>
+      <div id="pickRow">
+        <div id="pickSwatch"></div>
+        <span id="pickInfo">截取屏幕后，点击截图中的浮漂即可取色</span>
+      </div>
+      <div id="regionRow">
+        <span id="regionInfo">搜索区域：全图（在截图上拖拽可框选水面）</span>
+        <button id="btnClearRegion" type="button">清除区域</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="colour.js"></script>
+</body>
+</html>
