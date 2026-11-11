@@ -1,4 +1,4 @@
-/* 飞鱼动画 — FlyingFishAnimation 复刻（规格 docs/07 §7）
+/* 飞鱼动画 — FlyingFishAnimation 复刻（当前行为见仓库 docs/ui.md）
  * 30 条鱼、100×100、30ms 帧、越界回绕、index*33 < 高度才可见、旋转不实现（原 quirk）。 */
 
 class FlyingFish {

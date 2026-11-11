@@ -6,7 +6,7 @@
 //! - 单帧匹配点 >1000 视为配置错误，清空并报错。
 //!
 //! 与 C# 的结构差异：C# 直接把匹配像素染红画回位图，Rust 版输出独立 mask，
-//! 由 UI 叠加显示（见 docs/02-architecture.md §2）。
+//! 由 UI 叠加显示（见仓库 docs/architecture.md）。
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};

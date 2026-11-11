@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 时钟抽象（为可测性注入，见 docs/05-testing-strategy.md）。
+/// 时钟抽象（为可测性注入，见仓库 docs/development.md）。
 pub trait Clock: Send {
     fn now(&self) -> Instant;
 }

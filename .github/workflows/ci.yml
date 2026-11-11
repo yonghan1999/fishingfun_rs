@@ -1,0 +1,49 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装仓库指定的 Rust 工具链
+        run: rustup show active-toolchain
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 自动化测试
+        run: cargo test --workspace --locked
+      - name: 构建所有程序
+        run: cargo build --workspace --locked
+      - name: 检查前端脚本语法
+        run: |
+          foreach ($file in Get-ChildItem -LiteralPath "crates/gui/ui" -Filter "*.js") {
+            node --check "$($file.FullName)"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: 前端回归测试
+        run: node --test "tests/ui.test.cjs"
+      - name: 检查 PowerShell 脚本语法
+        run: |
+          foreach ($file in Get-ChildItem -LiteralPath "." -Filter "*.ps1") {
+            $parseErrors = $null
+            $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          }

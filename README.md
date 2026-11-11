@@ -1,0 +1,103 @@
+# FishingFun Rust
+
+FishingFun 的 Rust 迁移版本，面向 Windows，通过屏幕颜色识别浮漂、监测浮漂下沉并发送键鼠操作。提供 Tauri 图形界面、命令行入口和独立的输入来源观察工具。
+
+## 环境准备
+
+- Windows 10/11 x64，交互式桌面会话。
+- [Rustup](https://rustup.rs/)；仓库的 `rust-toolchain.toml` 固定 Rust 1.99.1，包含 rustfmt 和 Clippy。
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) 的“使用 C++ 的桌面开发”工作负载，以及 Windows SDK；使用 MSVC 目标 `x86_64-pc-windows-msvc`。
+- GUI 运行需要 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+- Node.js 24：仅用于前端 JavaScript 语法检查。GUI 是静态 HTML/CSS/JS，无需 npm、前端打包器或 Tauri CLI。
+
+首次进入仓库后执行 `rustup show active-toolchain`，Rustup 会按仓库声明安装工具链。默认的旧版 stable 不会覆盖仓库工具链。
+
+## 构建与运行
+
+以下命令均在仓库根目录的 PowerShell 中执行：
+
+```powershell
+cargo build --workspace --locked
+cargo run -p fishing-gui --locked
+```
+
+GUI 可配置抛竿按键、羽毛颜色、颜色分类参数、拾取延迟和咬钩阈值；在颜色配置窗口点击截图可取色，拖动截图可指定水面搜索区域。产品名和主窗口标题沿用当前配置中的 `Google Chrome`。
+
+控制台先查看参数，再按需启动：
+
+```powershell
+cargo run -p fishing-console --locked -- --help
+cargo run -p fishing-console --locked -- --blue --cast-key D4 --ten-min-keys D5,D6 --strike-value 7
+```
+
+控制台默认抛竿键为 D4、十分钟宏键为 D5、下沉阈值为 7 像素。GUI 的十分钟宏键固定为 D5、D6。启动机器人会先发送空格；宏键在启动及十分钟周期到期时执行。应先核对游戏内按键绑定。
+
+输入来源工具是独立的 Win32 窗口，显示收到的输入设备类型和来源：
+
+```powershell
+cargo run -p input-source --locked
+```
+
+发布构建：
+
+```powershell
+cargo build --workspace --release --locked
+```
+
+默认产物在 `target/debug/` 或 `target/release/`，分别为 `fishing-gui.exe`、`fishing-console.exe`、`input-source.exe`。支持 Cargo 标准的 `CARGO_TARGET_DIR`。目前未启用安装包生成（`bundle.active = false`）。
+
+## 配置与使用边界
+
+GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPDATA%/com.fishingfun.app/settings.json`，不受启动工作目录影响：
+
+| JSON 字段 | 内容 | 默认值 |
+| --- | --- | --- |
+| `cast_key` | ConsoleKey/Win32 VK 整数 | 52（D4） |
+| `strike_value` | 1..100 下沉阈值整数 | 7 |
+| `search_region` | `{x,y,width,height}`，截图位图坐标 | null（全图搜索） |
+
+首次创建 JSON 时，从当时工作目录的 `keybind.txt`、`strikevalue.txt`、`searchregion.txt` 导入合法值，旧文件保留。已有 JSON 后不再重复导入；JSON 损坏会报告错误，不静默覆盖。保存成功后设置才生效，运行中保存失败会在窗口底部显示。
+
+抛竿键、颜色参数、拾取延迟及搜索区域可在运行中更新。咬钩阈值在下次启动机器人时生效；颜色参数和拾取延迟当前不跨应用重启保存。控制台使用命令行参数，不读取这些 GUI 配置文件。
+
+截屏固定取主显示器中央区域：原点 `(W/4,H/4)`，宽 `W/2`，高 `H/2-100`；并非按游戏窗口捕获。游戏水面和浮漂需要在此范围内可见。进程名匹配 `wow`、`wowclassic`、`wow-64`。窗口位置、多显示器、DPI 和权限边界见[开发与限制说明](docs/development.md)。
+
+## 验证
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --locked
+node --test "tests/ui.test.cjs"
+Get-ChildItem -LiteralPath "crates/gui/ui" -Filter "*.js" | ForEach-Object { node --check "$($_.FullName)" }
+```
+
+GUI 冒烟脚本只启动界面，不点击“开始”，因此不会主动执行钓鱼流程：
+
+```powershell
+& "./smoke-gui.ps1"
+& "./smoke-shot.ps1"
+& "./smoke-gui.ps1" -Profile release
+```
+
+截图默认写入仓库根目录的 `gui-smoke.png`。可用 `-ExePath` 指定现有程序、`-TimeoutSeconds` 指定窗口等待时间，截图脚本可用 `-OutputPath` 指定已有目录内的输出文件。默认可执行文件路径通过 `cargo metadata` 获取，支持自定义构建目录；脚本退出时回收其启动的进程。检查失败会抛出错误，作为独立 PowerShell 进程运行时返回非零退出码。
+
+Windows CI 对推送和 PR 执行格式、Clippy、工作区测试、完整构建及脚本语法检查。需要真实桌面的截图/输入测试默认忽略，手工验证方法及测试覆盖边界见[开发说明](docs/development.md)。
+
+## 代码导航
+
+| 目录 | 职责 |
+| --- | --- |
+| `crates/core` | 平台无关的颜色分类、浮漂查找、咬钩判断和钓鱼流程 |
+| `crates/platform-windows` | GDI 截屏、进程/窗口查找、键鼠操作 |
+| `crates/gui` | Tauri 2 后端、静态 Web 前端及资源 |
+| `crates/console` | Clap 命令行入口与 DPI manifest |
+| `crates/input-source` | 输入设备和输入来源观察工具 |
+
+- [架构与数据流](docs/architecture.md)
+- [开发、验证及已知限制](docs/development.md)
+- [GUI 行为与配置](docs/ui.md)
+- [浮漂锁定跟踪算法](docs/tracking.md)
+
+源码保留了 C# 迁移模块编号和行为对照注释；以上文档根据当前 Rust 实现整理，不代表已恢复原项目的迁移规格或历史记录。
