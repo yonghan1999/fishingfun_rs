@@ -1,6 +1,6 @@
-/* 振幅图表 — LiveCharts ConstantChangesChart 复刻（规格 docs/07 §4）
+/* 振幅图表 — LiveCharts ConstantChangesChart 复刻（当前行为见仓库 docs/ui.md）
  * 三条线：数据主线(红 #F34336 6px + 圆形数据标签)、零线(蓝 1px + LightBlue 填充)、
- * 阈值线(黑 1px, y=-7)。X 轴窗口 [now-8s, now+1s] 滚动，无 X 标签/分隔线。 */
+ * 阈值线跟随实际生效值。X 轴窗口 [now-8s, now+1s] 滚动，无 X 标签/分隔线。 */
 
 class AmplitudeChart {
   constructor(canvas) {
@@ -9,6 +9,7 @@ class AmplitudeChart {
     this.data = [];       // {t: ms, v: amplitude}
     this.zeroLine = [];   // 蓝线
     this.strikeLine = []; // 黑线（阈值 -7）
+    this.strikeValue = 7;
     this.clearChart();
     this._tick = this._tick.bind(this);
     requestAnimationFrame(this._tick);
@@ -18,12 +19,17 @@ class AmplitudeChart {
     this.data.push({ t: Date.now(), v: value });
   }
 
+  setStrikeValue(value) {
+    this.strikeValue = value;
+    this.strikeLine = this.strikeLine.map(point => ({ ...point, v: -value }));
+  }
+
   /* C# ClearChart：清空后零线 (now-12s,0)-(now+25s,0)，阈值线 y=-7 同区间 */
   clearChart() {
     const now = Date.now();
     this.data = [];
     this.zeroLine = [{ t: now - 12000, v: 0 }, { t: now + 25000, v: 0 }];
-    this.strikeLine = [{ t: now - 12000, v: -7 }, { t: now + 25000, v: -7 }];
+    this.strikeLine = [{ t: now - 12000, v: -this.strikeValue }, { t: now + 25000, v: -this.strikeValue }];
   }
 
   _tick() {
@@ -44,7 +50,7 @@ class AmplitudeChart {
 
     const now = Date.now();
     const xMin = now - 8000, xMax = now + 1000;   // SetAxisLimits: 后 8s 前 1s
-    const yMin = -10, yMax = 5;
+    const yMin = -Math.max(10, this.strikeValue + 5), yMax = 5;
     const X = t => ((t - xMin) / (xMax - xMin)) * w;
     const Y = v => h - ((v - yMin) / (yMax - yMin)) * h;
 
@@ -77,7 +83,7 @@ class AmplitudeChart {
     }
 
     // 阈值线：黑 1px
-    const strike = this._window(this.strikeLine, xMin, xMax);
+    const strike = [{ t: xMin, v: -this.strikeValue }, { t: xMax, v: -this.strikeValue }];
     if (strike.length >= 2) {
       ctx.strokeStyle = "#000";
       ctx.lineWidth = 1;

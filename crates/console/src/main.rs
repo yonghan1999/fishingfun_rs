@@ -38,7 +38,7 @@ struct Args {
     ten_min_keys: Vec<String>,
 
     /// 咬钩判定阈值（浮漂下沉像素数）
-    #[arg(long, default_value_t = 7)]
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(i32).range(1..=100))]
     strike_value: i32,
 }
 

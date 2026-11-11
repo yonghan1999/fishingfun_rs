@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use fishing_core::cancellation::CancellationToken;
 use fishing_core::traits::{Key, KeySender, MouseController};
 use fishing_core::Point;
 use rand::Rng;
@@ -316,6 +317,13 @@ impl WowMouseController {
 impl MouseController for WowMouseController {
     /// C# RightClickMouse → RightClickMouse_LiamCooper 流程，逐步保真。
     fn right_click_at(&mut self, position: Point) {
+        self.right_click_cancellable(position, &CancellationToken::default());
+    }
+
+    fn right_click_cancellable(&mut self, position: Point, cancel: &CancellationToken) {
+        if cancel.is_cancelled() {
+            return;
+        }
         let Some(wow) = find_wow_process(None) else {
             return;
         };
@@ -324,24 +332,36 @@ impl MouseController for WowMouseController {
         unsafe {
             mouse_event(MOUSEEVENTF_RIGHTUP, position.x, position.y, 0, 0);
             let mut old = POINT::default();
-            let _ = GetCursorPos(&mut old);
 
-            std::thread::sleep(Duration::from_millis(200));
+            if !cancel.wait(Duration::from_millis(200)) {
+                return;
+            }
+            if GetCursorPos(&mut old).is_err() {
+                return;
+            }
             let _ = SetCursorPos(position.x, position.y);
-            std::thread::sleep(Duration::from_millis(loot_delay));
+            if !cancel.wait(Duration::from_millis(loot_delay)) {
+                let _ = SetCursorPos(old.x, old.y);
+                return;
+            }
             mouse_event(MOUSEEVENTF_RIGHTDOWN, position.x, position.y, 0, 0);
             std::thread::sleep(Duration::from_millis(
                 30 + rand::thread_rng().gen_range(0..47),
             ));
             mouse_event(MOUSEEVENTF_RIGHTUP, position.x, position.y, 0, 0);
 
+            // 按下后必须成对释放；取消后只恢复光标，不再发送焦点/按键消息。
+            if cancel.is_cancelled() {
+                let _ = SetCursorPos(old.x, old.y);
+                return;
+            }
             self.refocus(wow.main_window, old);
-            std::thread::sleep(Duration::from_millis(loot_delay / 2));
+            cancel.wait(Duration::from_millis(loot_delay / 2));
         }
     }
 }
 
-/// 冒烟测试（docs/05-testing-strategy.md 第 3 层：以记事本为假目标）。
+/// 冒烟测试（见仓库 docs/development.md：以记事本为假目标）。
 #[cfg(test)]
 mod tests {
     use super::*;

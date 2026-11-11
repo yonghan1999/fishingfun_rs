@@ -3,9 +3,11 @@
 
 pub mod bite_watcher;
 pub mod bobber_finder;
+pub mod cancellation;
 pub mod classifier;
 pub mod events;
 pub mod fish_bot;
+pub mod latest;
 pub mod timed_action;
 pub mod tracking_finder;
 pub mod traits;
@@ -36,7 +38,7 @@ impl std::fmt::Display for Point {
     }
 }
 
-/// 位图坐标矩形（扩展功能：F3 水面搜索区域，docs/08-tracking-finder.md）。
+/// 位图坐标矩形（扩展功能：F3 水面搜索区域，见仓库 docs/tracking.md）。
 /// 坐标系与 ScreenCapture 输出位图一致（原点在截屏左上角）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
@@ -57,6 +59,9 @@ impl Rect {
     }
 
     pub fn contains(&self, p: Point) -> bool {
-        p.x >= self.x && p.x < self.x + self.width && p.y >= self.y && p.y < self.y + self.height
+        p.x >= self.x
+            && (p.x as i64) < self.x as i64 + self.width as i64
+            && p.y >= self.y
+            && (p.y as i64) < self.y as i64 + self.height as i64
     }
 }

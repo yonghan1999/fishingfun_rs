@@ -9,7 +9,7 @@ pub enum ClassifierMode {
 }
 
 /// 对应 PixelClassifier（实现 IPixelClassifier）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PixelClassifier {
     pub colour_multiplier: f64,
     pub colour_closeness_multiplier: f64,

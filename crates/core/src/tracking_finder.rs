@@ -1,11 +1,11 @@
-//! F3 扩展：锁定跟踪浮漂查找器（docs/08-tracking-finder.md）。
+//! F3 扩展：锁定跟踪浮漂查找器（见仓库 docs/tracking.md）。
 //! 相对 SearchBobberFinder（C# 保真版，保留给 console）的改进：
 //! - 团块密度过滤：稀疏笔画（玩家红名/蓝名）不参与计分；
 //! - 连续帧确认：全局候选须连续出现才锁定，路过干扰免疫；
 //! - 锁定后小窗跟踪 + 丢失容忍：波浪短暂盖住羽毛时保持上次位置；
 //! - 可选水面搜索区域：全局搜索只认框内。
 
-use std::sync::mpsc::Sender;
+use crate::latest::LatestSender;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ use crate::classifier::PixelClassifier;
 use crate::traits::{BobberFinder, CapturedFrame, ScreenCapture};
 use crate::{Point, Rect};
 
-/// 可调参数（默认值见 docs/08 §2）。
+/// 可调参数（默认值见仓库 docs/tracking.md）。
 #[derive(Debug, Clone)]
 pub struct TrackingConfig {
     /// 密度过滤邻域半径（窗口边长 = 2r+1）
@@ -76,7 +76,12 @@ pub struct TrackingBobberFinder<C: ScreenCapture> {
     state: State,
     /// Locked 状态下最后一次命中的墙钟时刻（丢失容忽略）
     last_seen: Option<Instant>,
-    frame_handler: Option<Sender<FrameEvent>>,
+    frame_handler: Option<LatestSender<FrameEvent>>,
+    raw: Vec<bool>,
+    integral: Vec<u32>,
+    points: Vec<Point>,
+    last_preview: Option<Instant>,
+    last_colour_warning: Option<Instant>,
 }
 
 impl<C: ScreenCapture> TrackingBobberFinder<C> {
@@ -91,6 +96,11 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
             state: State::Searching,
             last_seen: None,
             frame_handler: None,
+            raw: Vec::new(),
+            integral: Vec::new(),
+            points: Vec::new(),
+            last_preview: None,
+            last_colour_warning: None,
         }
     }
 
@@ -112,95 +122,166 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
             state: State::Searching,
             last_seen: None,
             frame_handler: None,
+            raw: Vec::new(),
+            integral: Vec::new(),
+            points: Vec::new(),
+            last_preview: None,
+            last_colour_warning: None,
         }
     }
 
     pub fn with_config(mut self, cfg: TrackingConfig) -> Self {
+        assert!(
+            cfg.density_radius >= 0
+                && cfg.track_radius >= 0
+                && cfg.confirm_tolerance >= 0
+                && cfg.jump_tolerance >= 0
+        );
         self.cfg = cfg;
         self
     }
 
-    pub fn set_frame_handler(&mut self, handler: Sender<FrameEvent>) {
+    pub fn set_frame_handler(&mut self, handler: LatestSender<FrameEvent>) {
         self.frame_handler = Some(handler);
     }
 
     fn refresh_shared(&mut self) {
         if let SharedSource::Shared(shared) = &self.classifier_source {
             if let Ok(latest) = shared.read() {
+                if self.classifier != *latest {
+                    self.state = State::Searching;
+                    self.last_seen = None;
+                }
                 self.classifier = latest.clone();
             }
         }
         if let SharedSource::Shared(shared) = &self.region_source {
             if let Ok(latest) = shared.read() {
+                if self.region != *latest {
+                    self.state = State::Searching;
+                    self.last_seen = None;
+                }
                 self.region = *latest;
             }
         }
     }
 
     /// 像素分类 + 密度过滤，返回过滤后的匹配点与掩码。
-    fn find_match_points(&self, image: &RgbImage) -> (Vec<Point>, Vec<bool>) {
-        let width = image.width() as i32;
-        let height = image.height() as i32;
-        let n = (width * height) as usize;
-
-        // 1) 逐像素分类
-        let mut raw = vec![false; n];
+    fn find_match_points(
+        &mut self,
+        image: &RgbImage,
+        bounds: Rect,
+        preview: bool,
+    ) -> (Vec<Point>, Vec<bool>) {
+        let mut points = std::mem::take(&mut self.points);
+        points.clear();
+        let mut mask = if preview {
+            vec![false; image.width() as usize * image.height() as usize]
+        } else {
+            Vec::new()
+        };
+        if bounds.width == 0 || bounds.height == 0 {
+            return (points, mask);
+        }
+        let radius = self.cfg.density_radius;
+        let halo = clip(
+            Rect::new(
+                bounds.x.saturating_sub(radius),
+                bounds.y.saturating_sub(radius),
+                bounds.width.saturating_add(radius.saturating_mul(2)),
+                bounds.height.saturating_add(radius.saturating_mul(2)),
+            ),
+            Rect::new(0, 0, image.width() as i32, image.height() as i32),
+        );
+        let width = halo.width as usize;
+        let height = halo.height as usize;
+        self.raw.resize(width * height, false);
+        self.integral.resize((width + 1) * (height + 1), 0);
+        self.integral.fill(0);
+        let stride = width + 1;
         for y in 0..height {
+            let mut row_sum = 0;
             for x in 0..width {
-                let p = image.get_pixel(x as u32, y as u32);
-                if self.classifier.is_match(p[0], p[1], p[2]) {
-                    raw[(y * width + x) as usize] = true;
-                }
+                let pixel = image.get_pixel(halo.x as u32 + x as u32, halo.y as u32 + y as u32);
+                let hit = self.classifier.is_match(pixel[0], pixel[1], pixel[2]);
+                self.raw[y * width + x] = hit;
+                row_sum += u32::from(hit);
+                self.integral[(y + 1) * stride + x + 1] =
+                    self.integral[y * stride + x + 1] + row_sum;
             }
         }
-
-        // 2) 密度过滤（积分图）：稀疏笔画剔除
-        let filtered = density_filter(&raw, width, height, self.cfg.density_radius, self.cfg.density_min);
-
-        let mut points = Vec::new();
-        for y in 0..height {
-            for x in 0..width {
-                if filtered[(y * width + x) as usize] {
+        for y in bounds.y..bounds.y + bounds.height {
+            for x in bounds.x..bounds.x + bounds.width {
+                let (lx, ly) = ((x - halo.x) as usize, (y - halo.y) as usize);
+                if !self.raw[ly * width + lx] {
+                    continue;
+                }
+                let r = radius as usize;
+                let (x0, y0) = (lx.saturating_sub(r), ly.saturating_sub(r));
+                let (x1, y1) = ((lx + r + 1).min(width), (ly + r + 1).min(height));
+                let count = self.integral[y1 * stride + x1] + self.integral[y0 * stride + x0]
+                    - self.integral[y0 * stride + x1]
+                    - self.integral[y1 * stride + x0];
+                if count >= self.cfg.density_min {
                     points.push(Point::new(x, y));
+                    if preview {
+                        mask[y as usize * image.width() as usize + x as usize] = true;
+                    }
                 }
             }
         }
-
-        // 沿用 C#：单帧匹配点 >1000 视为配置错误
         if points.len() > 1000 {
-            tracing::error!(
-                "Error: Too much of the feather colour in this image, please adjust the colour configuration !"
-            );
+            if self
+                .last_colour_warning
+                .is_none_or(|time| time.elapsed() >= Duration::from_secs(5))
+            {
+                tracing::warn!(
+                    "Too many feather-colour pixels in search area; adjust colour settings"
+                );
+                self.last_colour_warning = Some(Instant::now());
+            }
             points.clear();
-            return (points, vec![false; n]);
+            mask.fill(false);
         }
+        (points, mask)
+    }
 
-        (points, filtered)
+    fn global_bounds(&self, image: &RgbImage) -> Rect {
+        let full = Rect::new(0, 0, image.width() as i32, image.height() as i32);
+        self.region.map_or(full, |region| clip(region, full))
+    }
+
+    fn active_bounds(&self, image: &RgbImage) -> Rect {
+        let global = self.global_bounds(image);
+        let center = match self.state {
+            State::Searching => return global,
+            State::Confirming { candidate, .. } => candidate,
+            State::Locked { pos } => pos,
+        };
+        let r = self.cfg.track_radius;
+        clip(
+            Rect::new(
+                center.x.saturating_sub(r),
+                center.y.saturating_sub(r),
+                r.saturating_mul(2).saturating_add(1),
+                r.saturating_mul(2).saturating_add(1),
+            ),
+            global,
+        )
     }
 
     /// 在 points 中取 window 内（±track_radius 围绕 center）计分最高者。
     fn best_in_window(&self, points: &[Point], center: Point) -> Option<Point> {
-        let r = self.cfg.track_radius;
-        let windowed: Vec<Point> = points
+        debug_assert!(points
             .iter()
-            .copied()
-            .filter(|p| (p.x - center.x).abs() <= r && (p.y - center.y).abs() <= r)
-            .collect();
-        Score::score_points(&windowed).map(|s| s.point)
+            .all(|p| dist_within(*p, center, self.cfg.track_radius)));
+        Score::score_points(points).map(|s| s.point)
     }
 
     /// Searching/Confirming 失败后的全局搜索（受搜索区域约束）。
     /// 返回锁定结果（仅当 confirm_frames <= 1 时立即锁定）。
     fn search_global(&mut self, points: &[Point]) -> Option<Point> {
-        let candidates: Vec<Point> = match self.region {
-            Some(region) => points
-                .iter()
-                .copied()
-                .filter(|p| region.contains(*p))
-                .collect(),
-            None => points.to_vec(),
-        };
-        let best = Score::score_points(&candidates).map(|s| s.point);
+        let best = Score::score_points(points).map(|s| s.point);
         match best {
             Some(p) => {
                 if self.cfg.confirm_frames <= 1 {
@@ -223,43 +304,17 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
     }
 }
 
-/// 密度过滤：匹配像素仅当其 (2r+1)² 邻域内同色像素数 ≥ min_count 时保留。
-/// 积分图一次构建，逐像素窗口和 O(1)。
-fn density_filter(mask: &[bool], width: i32, height: i32, radius: i32, min_count: u32) -> Vec<bool> {
-    let iw = (width + 1) as usize;
-    let mut integral = vec![0u32; ((width + 1) * (height + 1)) as usize];
-    for y in 0..height {
-        let mut row_sum = 0u32;
-        for x in 0..width {
-            if mask[(y * width + x) as usize] {
-                row_sum += 1;
-            }
-            integral[(y as usize + 1) * iw + (x as usize + 1)] =
-                integral[y as usize * iw + (x as usize + 1)] + row_sum;
-        }
-    }
-
-    let window_sum = |cx: i32, cy: i32| -> u32 {
-        let x0 = (cx - radius).max(0);
-        let y0 = (cy - radius).max(0);
-        let x1 = (cx + radius + 1).min(width);
-        let y1 = (cy + radius + 1).min(height);
-        let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
-        // 先加后减，避免中间步骤下溢（debug 溢出检查）
-        (integral[y1 * iw + x1] + integral[y0 * iw + x0])
-            - (integral[y0 * iw + x1] + integral[y1 * iw + x0])
-    };
-
-    let mut out = vec![false; (width * height) as usize];
-    for y in 0..height {
-        for x in 0..width {
-            let i = (y * width + x) as usize;
-            if mask[i] && window_sum(x, y) >= min_count {
-                out[i] = true;
-            }
-        }
-    }
-    out
+fn clip(rect: Rect, limit: Rect) -> Rect {
+    let x = rect.x.max(limit.x);
+    let y = rect.y.max(limit.y);
+    let end_x = (rect.x as i64 + rect.width as i64).min(limit.x as i64 + limit.width as i64);
+    let end_y = (rect.y as i64 + rect.height as i64).min(limit.y as i64 + limit.height as i64);
+    Rect::new(
+        x,
+        y,
+        (end_x - x as i64).max(0) as i32,
+        (end_y - y as i64).max(0) as i32,
+    )
 }
 
 fn dist_within(a: Point, b: Point, tol: i32) -> bool {
@@ -275,7 +330,12 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
     fn find(&mut self) -> Option<Point> {
         self.refresh_shared();
         let frame = self.capture.capture();
-        let (points, mask) = self.find_match_points(&frame.image);
+        let preview = self.frame_handler.is_some()
+            && self
+                .last_preview
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(66));
+        let bounds = self.active_bounds(&frame.image);
+        let (mut points, mut mask) = self.find_match_points(&frame.image, bounds, preview);
 
         let now = Instant::now();
         let result: Option<Point> = match self.state {
@@ -298,6 +358,12 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                         if held {
                             Some(pos)
                         } else {
+                            self.points = points;
+                            (points, mask) = self.find_match_points(
+                                &frame.image,
+                                self.global_bounds(&frame.image),
+                                preview,
+                            );
                             self.search_global(&points)
                         }
                     }
@@ -321,21 +387,33 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                             None
                         }
                     }
-                    None => self.search_global(&points),
+                    None => {
+                        self.points = points;
+                        (points, mask) = self.find_match_points(
+                            &frame.image,
+                            self.global_bounds(&frame.image),
+                            preview,
+                        );
+                        self.search_global(&points)
+                    }
                 }
             }
             State::Searching => self.search_global(&points),
         };
 
-        if let Some(tx) = &self.frame_handler {
-            let _ = tx.send(FrameEvent {
-                frame: CapturedFrame {
-                    origin: frame.origin,
-                    image: frame.image,
-                },
-                mask,
-                bobber: result,
-            });
+        self.points = points;
+        if preview {
+            if let Some(tx) = &self.frame_handler {
+                self.last_preview = Some(Instant::now());
+                tx.send(FrameEvent {
+                    frame: CapturedFrame {
+                        origin: frame.origin,
+                        image: frame.image,
+                    },
+                    mask,
+                    bobber: result,
+                });
+            }
         }
 
         // 位图坐标 → 屏幕坐标
@@ -348,6 +426,105 @@ mod tests {
     use super::*;
     use image::Rgb;
 
+    #[test]
+    fn large_outside_colour_does_not_invalidate_region_or_locked_tracking() {
+        let mut img = red_block_image(500, 300, 50, 50, 10);
+        paint_block(&mut img, 300, 30, 100, 100, [255, 0, 0]);
+        let region = Arc::new(RwLock::new(Some(Rect::new(0, 0, 150, 150))));
+        let mut finder = TrackingBobberFinder::new_shared(
+            Arc::new(RwLock::new(PixelClassifier::new())),
+            region,
+            Frames::new(vec![img.clone(), img.clone(), img]),
+        );
+        assert_eq!(finder.find(), None);
+        let first = finder.find().expect("框外大色块不能干扰锁定");
+        assert_eq!(finder.find(), Some(first));
+        assert!(finder.raw.len() < 170 * 170, "锁定后不应处理全图");
+    }
+
+    #[test]
+    fn region_update_unlocks_and_never_holds_position_outside_new_region() {
+        let img = red_block_image(300, 200, 50, 50, 10);
+        let region = Arc::new(RwLock::new(None));
+        let mut finder = TrackingBobberFinder::new_shared(
+            Arc::new(RwLock::new(PixelClassifier::new())),
+            region.clone(),
+            Frames::new(vec![img.clone(), img.clone(), img]),
+        );
+        finder.find();
+        assert!(finder.find().is_some());
+        *region.write().unwrap() = Some(Rect::new(200, 0, 100, 200));
+        assert_eq!(finder.find(), None);
+    }
+
+    #[test]
+    fn local_density_matches_full_frame_at_edges_and_reuses_scratch_buffers() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        let image = RgbImage::from_fn(90, 70, |_, _| {
+            if rng.gen_bool(0.7) {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 0, 0])
+            }
+        });
+        let mut finder = finder_with(vec![]);
+        let (full, _) = finder.find_match_points(&image, Rect::new(0, 0, 90, 70), true);
+        // 避免 >1000 点保护影响对拍，使用较严格的密度条件。
+        if full.is_empty() {
+            finder.cfg.density_min = 40;
+        }
+        let (full, _) = finder.find_match_points(&image, Rect::new(0, 0, 90, 70), true);
+        assert!(!full.is_empty());
+        for bounds in [
+            Rect::new(0, 0, 10, 20),
+            Rect::new(80, 50, 10, 20),
+            Rect::new(20, 20, 25, 25),
+        ] {
+            let expected: Vec<_> = full
+                .iter()
+                .copied()
+                .filter(|p| bounds.contains(*p))
+                .collect();
+            let (local, _) = finder.find_match_points(&image, bounds, true);
+            assert_eq!(local, expected);
+            finder.points = local;
+            let raw_ptr = finder.raw.as_ptr();
+            let integral_ptr = finder.integral.as_ptr();
+            let (points, _) = finder.find_match_points(&image, bounds, false);
+            assert_eq!(raw_ptr, finder.raw.as_ptr());
+            assert_eq!(integral_ptr, finder.integral.as_ptr());
+            finder.points = points;
+        }
+    }
+
+    #[test]
+    #[ignore = "手工性能测量：cargo test -p fishing-core --release benchmark_search_areas -- --ignored --nocapture"]
+    fn benchmark_search_areas() {
+        for (width, height) in [(960, 440), (1280, 620), (1920, 980)] {
+            let image = red_block_image(width, height, 300, 200, 10);
+            let mut finder = finder_with(vec![]);
+            for bounds in [
+                Rect::new(0, 0, width as i32, height as i32),
+                Rect::new(225, 125, 161, 161),
+            ] {
+                let start = Instant::now();
+                for _ in 0..100 {
+                    let (points, _) =
+                        finder.find_match_points(std::hint::black_box(&image), bounds, false);
+                    assert!(!points.is_empty());
+                    finder.points = points;
+                }
+                println!(
+                    "{width}x{height} area={}x{} classify_density_us={:.1}",
+                    bounds.width,
+                    bounds.height,
+                    start.elapsed().as_secs_f64() * 10_000.0
+                );
+            }
+        }
+    }
+
     const ORIGIN: Point = Point { x: 480, y: 270 };
 
     struct Frames {
@@ -359,7 +536,10 @@ mod tests {
             Frames {
                 frames: images
                     .into_iter()
-                    .map(|image| CapturedFrame { image, origin: ORIGIN })
+                    .map(|image| CapturedFrame {
+                        image,
+                        origin: ORIGIN,
+                    })
                     .collect(),
             }
         }
@@ -367,9 +547,7 @@ mod tests {
 
     impl ScreenCapture for Frames {
         fn capture(&mut self) -> CapturedFrame {
-            self.frames
-                .pop_front()
-                .expect("capture 被调用次数超过预期")
+            self.frames.pop_front().expect("capture 被调用次数超过预期")
         }
     }
 
@@ -475,8 +653,8 @@ mod tests {
             lost_tolerance: Duration::ZERO,
             ..Default::default()
         };
-        let mut f = TrackingBobberFinder::new(PixelClassifier::new(), Frames::new(frames))
-            .with_config(cfg);
+        let mut f =
+            TrackingBobberFinder::new(PixelClassifier::new(), Frames::new(frames)).with_config(cfg);
         f.find();
         assert!(f.find().is_some());
         assert_eq!(f.find(), None, "容忍期过后应放弃并重搜（无果→None）");
@@ -532,12 +710,12 @@ mod tests {
         paint_block(&mut img, 50, 60, 10, 10, [255, 0, 0]);
         paint_stroke(&mut img, 120, 30, 40, [255, 0, 0]);
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crate::latest::channel();
         let mut f = finder_with(vec![img]);
         f.set_frame_handler(tx);
         f.find();
 
-        let ev = rx.try_recv().expect("应有帧事件");
+        let ev = rx.recv().expect("应有帧事件");
         let width = 200i32;
         // 块内部像素在掩码中（边缘像素被密度侵蚀，取块中心附近）
         assert!(ev.mask[(64 * width + 55) as usize]);

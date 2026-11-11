@@ -1,15 +1,15 @@
 //! M11: FishingFun GUI（Tauri 2）— WPF 版一比一复刻的后端。
 //! 职责：bot 线程生命周期管理、预览帧/钓鱼事件/日志 → 前端事件桥接、
-//! 分类器参数共享、keybind.txt 读写（与 C# 版格式互通）。
-//! 前端规格：migration/docs/07-ui-replica-spec.md
+//! 分类器参数共享、配置持久化与旧版文本配置迁移。
+//! 当前界面行为与配置见仓库 docs/ui.md。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, sync_channel, SyncSender};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use base64::Engine;
 use fishing_core::bite_watcher::PositionBiteWatcher;
@@ -18,42 +18,31 @@ use fishing_core::classifier::{ClassifierMode, PixelClassifier};
 use fishing_core::events::FishingEvent;
 use fishing_core::fish_bot::FishingBot;
 use fishing_core::tracking_finder::TrackingBobberFinder;
-use fishing_core::traits::{Key, KeySender, ScreenCapture};
+use fishing_core::traits::{Key, KeySender};
 use fishing_core::{Point, Rect};
 use fishing_platform_windows::{WowKeySender, WowMouseController, WowScreenCapture, LOOT_DELAY_MS};
 use image::{ImageFormat, Rgb, RgbImage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-const KEYBIND_FILE: &str = "keybind.txt";
-/// 咬钩判定阈值持久化文件（扩展功能，原版无此配置）
-const STRIKE_VALUE_FILE: &str = "strikevalue.txt";
-/// 水面搜索区域持久化文件（扩展功能，格式 "x,y,w,h"，截屏位图坐标）
-const SEARCH_REGION_FILE: &str = "searchregion.txt";
-/// 咬钩判定阈值（像素）：浮漂下沉超过该值才提竿。原版 C# 硬编码 7，
-/// 海水起伏大时容易误判，故改为可调（扩展功能，默认保持 7）。
-static STRIKE_VALUE: AtomicI32 = AtomicI32::new(7);
-/// 预览帧推送上限（C# 版受 GetPixel 性能限制天然低帧率；Rust 截屏快，
-/// 限帧避免 IPC 洪泛，见 docs/03-tech-stack.md）
-const FRAME_INTERVAL: Duration = Duration::from_millis(66);
-
-struct BotHandle {
-    stop: Arc<AtomicBool>,
-    cast_key: Arc<Mutex<Key>>,
-}
+mod config;
+mod session;
+use config::ConfigStore;
+use session::{Phase, Sessions};
 
 struct AppState {
     /// 共享分类器（对应 C# MainWindow 与 ColourConfiguration 共享同一实例）
     classifier: Arc<RwLock<PixelClassifier>>,
     /// 共享水面搜索区域（扩展功能 F3，None = 全图）
     search_region: Arc<RwLock<Option<Rect>>>,
-    bot: Mutex<Option<BotHandle>>,
+    bot: Sessions,
+    config: ConfigStore,
 }
 
 // ---------------------------------------------------------------- 日志桥接
 
 /// tracing → 前端日志列表（对应 C# MainWindow 注册为 log4net IAppender）。
-static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
+static LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
 
 struct LogWriter;
 
@@ -62,7 +51,7 @@ impl std::io::Write for LogWriter {
         if let Some(tx) = LOG_TX.get() {
             let line = String::from_utf8_lossy(buf).trim_end().to_string();
             if !line.is_empty() {
-                let _ = tx.send(line);
+                let _ = tx.try_send(line);
             }
         }
         Ok(buf.len())
@@ -139,12 +128,12 @@ fn draw_thick_line(img: &mut RgbImage, from: (i32, i32), to: (i32, i32), c: Rgb<
     }
 }
 
-fn encode_frame(ev: &FrameEvent, mode: ClassifierMode) -> Option<FramePayload> {
-    let mut img = ev.frame.image.clone();
+fn encode_frame(ev: FrameEvent, mode: ClassifierMode) -> Option<FramePayload> {
+    let mut img = ev.frame.image;
 
     // C# SearchBobberFinder 把命中像素染成纯红/蓝（ProcessPixel）
     let hl = highlight_colour(mode);
-    let width = ev.frame.image.width() as i32;
+    let width = img.width() as i32;
     for (i, &hit) in ev.mask.iter().enumerate() {
         if hit {
             let x = i as i32 % width;
@@ -171,137 +160,159 @@ fn encode_frame(ev: &FrameEvent, mode: ClassifierMode) -> Option<FramePayload> {
 
 // ---------------------------------------------------------------- 命令
 
+#[derive(Serialize, Clone)]
+struct BotStatus {
+    phase: Phase,
+    strike_value: i32,
+}
+
+fn status(state: &AppState) -> BotStatus {
+    match state.bot.current() {
+        Some(session) => BotStatus {
+            phase: session.phase(),
+            strike_value: session.strike,
+        },
+        None => BotStatus {
+            phase: Phase::Idle,
+            strike_value: state.config.get().strike_value,
+        },
+    }
+}
+
+#[tauri::command]
+fn bot_status(state: State<AppState>) -> BotStatus {
+    status(&state)
+}
+
 #[tauri::command]
 fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let guard = state.bot.lock().map_err(|e| e.to_string())?;
-    if guard.is_some() {
-        return Ok(()); // C#: bot == null 检查，运行中重复点击无效
-    }
-    drop(guard);
-
+    let config = state.config.get();
+    let key = Key::from_console_key_value(config.cast_key).ok_or("抛竿键无效")?;
+    let session = state.bot.reserve(key, config.strike_value)?;
     let classifier = state.classifier.clone();
     let search_region = state.search_region.clone();
     let app2 = app.clone();
-
-    // C# Play_Click：先按 Spacebar，sleep 1500，再启动 bot 线程
-    std::thread::spawn(move || {
-        let mut keys = WowKeySender::new();
-        keys.press_key(Key::SPACEBAR);
-        std::thread::sleep(Duration::from_millis(1500));
-
-        // 预览帧桥（限帧）；高亮色按分类器当前模式逐帧读取
-        let (frame_tx, frame_rx) = channel::<FrameEvent>();
-        let frame_app = app2.clone();
-        let frame_classifier = classifier.clone();
-        std::thread::spawn(move || {
-            let mut last = Instant::now() - FRAME_INTERVAL;
-            while let Ok(ev) = frame_rx.recv() {
-                if last.elapsed() < FRAME_INTERVAL {
-                    continue;
+    let worker_session = session.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fishing-session".into())
+        .spawn(move || {
+            let session = worker_session;
+            // 即使线程 panic，仍取消桥接线程并清理本次会话。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if session.cancel.is_cancelled() {
+                    return;
                 }
-                last = Instant::now();
-                let mode = frame_classifier
-                    .read()
-                    .map(|c| c.mode)
-                    .unwrap_or(ClassifierMode::Red);
-                if let Some(payload) = encode_frame(&ev, mode) {
-                    let _ = frame_app.emit("frame", payload);
+                let mut keys = WowKeySender::new();
+                keys.press_key(Key::SPACEBAR);
+                if !session.cancel.wait(Duration::from_millis(1500)) || !session.run() {
+                    return;
                 }
+                let _ = app2.emit("bot-status", ());
+
+                let (frame_tx, frame_rx) = fishing_core::latest::channel::<FrameEvent>();
+                let frame_app = app2.clone();
+                let frame_classifier = classifier.clone();
+                let frame_cancel = session.cancel.clone();
+                let frame_thread = std::thread::spawn(move || {
+                    while let Some(ev) = frame_rx.recv() {
+                        if frame_cancel.is_cancelled() {
+                            break;
+                        }
+                        let mode = frame_classifier
+                            .read()
+                            .map(|c| c.mode)
+                            .unwrap_or(ClassifierMode::Red);
+                        if let Some(payload) = encode_frame(ev, mode) {
+                            if frame_cancel.is_cancelled() {
+                                break;
+                            }
+                            let _ = frame_app.emit("frame", payload);
+                        }
+                    }
+                });
+                let (ev_tx, ev_rx) = channel::<FishingEvent>();
+                let ev_app = app2.clone();
+                let event_cancel = session.cancel.clone();
+                let event_thread = std::thread::spawn(move || {
+                    while let Ok(ev) = ev_rx.recv() {
+                        if event_cancel.is_cancelled() {
+                            break;
+                        }
+                        let _ = ev_app.emit("fishing-event", ev);
+                    }
+                });
+                let mut finder = TrackingBobberFinder::new_shared(
+                    classifier,
+                    search_region,
+                    WowScreenCapture::new(),
+                );
+                finder.set_frame_handler(frame_tx);
+                let mut bot = FishingBot::new(
+                    Box::new(finder),
+                    Box::new(PositionBiteWatcher::new(session.strike)),
+                    Box::new(WowKeySender::new()),
+                    Box::new(WowMouseController::new()),
+                    key,
+                    vec![Key::D5, Key::D6],
+                    ev_tx,
+                )
+                .with_session(session.cancel.clone(), session.cast_key.clone());
+                bot.start();
+                session.cancel.cancel();
+                drop(bot);
+                let _ = frame_thread.join();
+                let _ = event_thread.join();
+            }));
+            session.cancel.cancel();
+            if result.is_err() {
+                tracing::error!("Bot worker panicked");
+            }
+            if let Some(state) = app2.try_state::<AppState>() {
+                // 在会话锁仍占位时发送退出事件，防止新会话先启动后收到旧退出通知。
+                state.bot.finish_with(&session, || {
+                    let _ = app2.emit("bot-stopped", ());
+                });
             }
         });
-
-        // 钓鱼事件桥
-        let (ev_tx, ev_rx) = channel::<FishingEvent>();
-        let ev_app = app2.clone();
-        std::thread::spawn(move || {
-            while let Ok(ev) = ev_rx.recv() {
-                let _ = ev_app.emit("fishing-event", ev);
-            }
-        });
-
-        // F3：GUI 版换用锁定跟踪查找器（密度过滤/连续帧确认/丢失容忍/区域限制），
-        // console 版仍用 C# 保真的 SearchBobberFinder（docs/08）
-        let mut finder =
-            TrackingBobberFinder::new_shared(classifier, search_region, WowScreenCapture::new());
-        finder.set_frame_handler(frame_tx);
-
-        let keybind = read_keybind_value().unwrap_or(Key::D4);
-        let strike = STRIKE_VALUE.load(Ordering::SeqCst);
-        // C# GUI 版 ten-min 键固定 [D5, D6]
-        let mut bot = FishingBot::new(
-            Box::new(finder),
-            Box::new(PositionBiteWatcher::new(strike)),
-            Box::new(WowKeySender::new()),
-            Box::new(WowMouseController::new()),
-            keybind,
-            vec![Key::D5, Key::D6],
-            ev_tx,
-        );
-
-        let handle = BotHandle {
-            stop: bot.stop_handle(),
-            cast_key: bot.cast_key_handle(),
-        };
-        if let Some(state) = app2.try_state::<AppState>() {
-            *state.bot.lock().unwrap() = Some(handle);
-        }
-
-        bot.start();
-
-        // bot 退出（对应 C# BotThread 末尾 SetButtonStates(true)）
-        if let Some(state) = app2.try_state::<AppState>() {
-            *state.bot.lock().unwrap() = None;
-        }
-        let _ = app2.emit("bot-stopped", ());
-    });
-
+    if let Err(error) = spawned {
+        session.cancel.cancel();
+        state.bot.finish(&session);
+        return Err(error.to_string());
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn stop_bot(state: State<AppState>) -> Result<(), String> {
-    let guard = state.bot.lock().map_err(|e| e.to_string())?;
-    if let Some(h) = guard.as_ref() {
-        h.stop.store(false, Ordering::SeqCst);
+fn stop_bot(state: State<AppState>) {
+    if let Some(session) = state.bot.current() {
+        session.stop();
     }
-    Ok(())
 }
 
 #[tauri::command]
 fn bot_running(state: State<AppState>) -> bool {
-    state.bot.lock().map(|b| b.is_some()).unwrap_or(false)
-}
-
-/// C# KeyBindChooser：keybind.txt 存 ConsoleKey 整数值，读取失败回退 D4。
-fn read_keybind_value() -> Option<Key> {
-    let text = std::fs::read_to_string(KEYBIND_FILE).ok()?;
-    let v: i32 = text.trim().parse().ok()?;
-    Key::from_console_key_value(v)
+    state.bot.current().is_some()
 }
 
 #[tauri::command]
 fn get_cast_key(state: State<AppState>) -> String {
-    let running = state
+    let key = state
         .bot
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|h| *h.cast_key.lock().unwrap()));
-    let key = running.or_else(read_keybind_value).unwrap_or(Key::D4);
+        .current()
+        .map(|s| *s.cast_key.lock().unwrap_or_else(|e| e.into_inner()))
+        .or_else(|| Key::from_console_key_value(state.config.get().cast_key))
+        .unwrap_or(Key::D4);
     key.display_text()
 }
 
-/// C# KeyBind_KeyUp：e.Key 转 ConsoleKey（数值==VK 码）成功才保存并通知 bot。
-/// 前端直接传 KeyboardEvent.keyCode（WebView2 中即 Win32 VK 码）。
 #[tauri::command]
 fn set_cast_key(code: i32, state: State<AppState>) -> Result<bool, String> {
     let Some(key) = Key::from_console_key_value(code) else {
         return Ok(false);
     };
-    std::fs::write(KEYBIND_FILE, (key.vk_code() as i32).to_string()).map_err(|e| e.to_string())?;
-    if let Ok(guard) = state.bot.lock() {
-        if let Some(h) = guard.as_ref() {
-            *h.cast_key.lock().unwrap() = key;
-        }
+    state.config.update(|c| c.cast_key = code)?;
+    if let Some(session) = state.bot.current() {
+        *session.cast_key.lock().map_err(|e| e.to_string())? = key;
     }
     Ok(true)
 }
@@ -330,6 +341,13 @@ fn set_classifier_params(
     colour_closeness_multiplier: f64,
     state: State<AppState>,
 ) -> Result<(), String> {
+    if !colour_multiplier.is_finite()
+        || !(0.0..=3.0).contains(&colour_multiplier)
+        || !colour_closeness_multiplier.is_finite()
+        || !(0.0..=5.0).contains(&colour_closeness_multiplier)
+    {
+        return Err("颜色乘数必须在 0..3、接近度乘数必须在 0..5 之间".into());
+    }
     let mut c = state.classifier.write().map_err(|e| e.to_string())?;
     c.colour_multiplier = colour_multiplier;
     c.colour_closeness_multiplier = colour_closeness_multiplier;
@@ -341,7 +359,8 @@ fn set_classifier_mode(mode: String, state: State<AppState>) -> Result<(), Strin
     let mut c = state.classifier.write().map_err(|e| e.to_string())?;
     c.mode = match mode.as_str() {
         "Blue" => ClassifierMode::Blue,
-        _ => ClassifierMode::Red,
+        "Red" => ClassifierMode::Red,
+        _ => return Err("未知的羽毛颜色模式".into()),
     };
     Ok(())
 }
@@ -352,34 +371,31 @@ fn get_loot_delay() -> u64 {
 }
 
 #[tauri::command]
-fn set_loot_delay(ms: u64) {
+fn set_loot_delay(ms: u64) -> Result<(), String> {
+    if ms > 3500 {
+        return Err("拾取延迟必须在 0..3500ms 之间".into());
+    }
     LOOT_DELAY_MS.store(ms, Ordering::SeqCst);
-}
-
-fn read_strike_value() -> i32 {
-    std::fs::read_to_string(STRIKE_VALUE_FILE)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(7)
+    Ok(())
 }
 
 #[tauri::command]
-fn get_strike_value() -> i32 {
-    STRIKE_VALUE.load(Ordering::SeqCst)
+fn get_strike_value(state: State<AppState>) -> i32 {
+    state.config.get().strike_value
 }
 
 #[tauri::command]
-fn set_strike_value(v: i32) {
-    let v = v.clamp(1, 100);
-    STRIKE_VALUE.store(v, Ordering::SeqCst);
-    let _ = std::fs::write(STRIKE_VALUE_FILE, v.to_string());
+fn set_strike_value(v: i32, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    config::validate_strike(v)?;
+    state.config.update(|c| c.strike_value = v)?;
+    let _ = app.emit("bot-status", ());
+    Ok(())
 }
 
 /// 颜色配置窗口 Capture Screen（对应 C# WowScreen.GetBitmap）。
 #[tauri::command]
 fn capture_screen() -> Result<String, String> {
-    let mut cap = WowScreenCapture::new();
-    let frame = cap.capture();
+    let frame = WowScreenCapture::try_capture().map_err(|e| e.to_string())?;
     let mut buf = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(frame.image)
         .write_to(&mut buf, ImageFormat::Png)
@@ -389,26 +405,12 @@ fn capture_screen() -> Result<String, String> {
 
 // ---------------------------------------------------------------- 搜索区域（F3 扩展）
 
-fn read_search_region() -> Option<Rect> {
-    let text = std::fs::read_to_string(SEARCH_REGION_FILE).ok()?;
-    let parts: Vec<i32> = text
-        .trim()
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    if parts.len() == 4 && parts[2] > 0 && parts[3] > 0 {
-        Some(Rect::new(parts[0], parts[1], parts[2], parts[3]))
-    } else {
-        None
-    }
-}
-
 #[tauri::command]
 fn get_search_region(state: State<AppState>) -> Option<Rect> {
     state.search_region.read().ok().and_then(|r| *r)
 }
 
-/// 颜色配置窗口拖框结果（截屏位图坐标），持久化到 searchregion.txt。
+/// 颜色配置窗口拖框结果（截屏位图坐标），保存成功后才更新共享区域。
 #[tauri::command]
 fn set_search_region(
     x: i32,
@@ -417,21 +419,20 @@ fn set_search_region(
     height: i32,
     state: State<AppState>,
 ) -> Result<(), String> {
-    if width <= 0 || height <= 0 {
-        return Err("区域宽高必须为正".into());
-    }
     let rect = Rect::new(x, y, width, height);
-    *state.search_region.write().map_err(|e| e.to_string())? = Some(rect);
-    std::fs::write(SEARCH_REGION_FILE, format!("{x},{y},{width},{height}"))
-        .map_err(|e| e.to_string())?;
+    config::validate_region(rect)?;
+    let mut region = state.search_region.write().map_err(|e| e.to_string())?;
+    state.config.update(|c| c.search_region = Some(rect))?;
+    *region = Some(rect);
     tracing::info!("搜索区域已设置: {x},{y} {width}x{height}");
     Ok(())
 }
 
 #[tauri::command]
 fn clear_search_region(state: State<AppState>) -> Result<(), String> {
-    *state.search_region.write().map_err(|e| e.to_string())? = None;
-    let _ = std::fs::remove_file(SEARCH_REGION_FILE);
+    let mut region = state.search_region.write().map_err(|e| e.to_string())?;
+    state.config.update(|c| c.search_region = None)?;
+    *region = None;
     tracing::info!("搜索区域已清除（恢复全图搜索）");
     Ok(())
 }
@@ -449,7 +450,7 @@ fn spawn_colour_window(app: &AppHandle) -> Result<(), String> {
         .title("颜色配置")
         .inner_size(800.0, 450.0)
         // 用户实际在全屏（无边框）WoW 前使用：置顶+聚焦，避免窗口开到游戏后面
-        // 看起来像"打不开"（对 C# 版非置顶行为的有意修正，见 migration/logs）
+        // 看起来像"打不开"（对 C# 版非置顶行为的有意修正，见仓库 docs/ui.md）
         .always_on_top(true)
         .focused(true)
         .build()
@@ -469,7 +470,7 @@ async fn open_colour_window(app: AppHandle) -> Result<(), String> {
 // ---------------------------------------------------------------- main
 
 fn main() {
-    let (log_tx, log_rx) = channel::<String>();
+    let (log_tx, log_rx) = sync_channel::<String>(512);
     let _ = LOG_TX.set(log_tx);
     tracing_subscriber::fmt()
         .with_writer(|| LogWriter)
@@ -477,12 +478,26 @@ fn main() {
         .init();
 
     tauri::Builder::default()
-        .manage(AppState {
-            classifier: Arc::new(RwLock::new(PixelClassifier::new())),
-            search_region: Arc::new(RwLock::new(read_search_region())),
-            bot: Mutex::new(None),
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
+                if let Some(session) = window.state::<AppState>().bot.current() {
+                    session.stop();
+                }
+            }
         })
         .setup(|app| {
+            let directory = app.path().app_config_dir()?;
+            let config = ConfigStore::load(&directory, &std::env::current_dir()?)
+                .map_err(std::io::Error::other)?;
+            let settings = config.get();
+            app.manage(AppState {
+                classifier: Arc::new(RwLock::new(PixelClassifier::new())),
+                search_region: Arc::new(RwLock::new(settings.search_region)),
+                bot: Sessions::default(),
+                config,
+            });
             // C# MainWindow 构造：pixelClassifier.SetConfiguration(IsWowClassic())
             {
                 let state = app.state::<AppState>();
@@ -498,14 +513,13 @@ fn main() {
                 }
             });
 
-            // 读取持久化的咬钩判定阈值
-            STRIKE_VALUE.store(read_strike_value(), Ordering::SeqCst);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_bot,
             stop_bot,
             bot_running,
+            bot_status,
             get_cast_key,
             set_cast_key,
             get_classifier_config,

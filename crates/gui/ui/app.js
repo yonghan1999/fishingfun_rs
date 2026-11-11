@@ -1,6 +1,6 @@
-/* 主窗口逻辑 — MainWindow.xaml.cs 复刻（规格 docs/07 §2/§3/§6/§9） */
+/* 主窗口逻辑 — MainWindow.xaml.cs 复刻（当前行为见仓库 docs/ui.md） */
 
-const { invoke } = window.__TAURI__.core;
+const invoke = window.invokeWithFeedback;
 const { listen } = window.__TAURI__.event;
 
 const el = id => document.getElementById(id);
@@ -17,10 +17,9 @@ let hideCardsTimer = null;
 /* ---------------- 按钮 ---------------- */
 
 el("btnPlay").addEventListener("click", async () => {
-  const running = await invoke("bot_running");
-  if (running) return;
   setButtonStates(false);
-  await invoke("start_bot");
+  try { await invoke("start_bot"); }
+  finally { await syncStatus(); }
   // C#：10 分钟后自动隐藏两张卡（翻到背面）
   if (hideCardsTimer) clearTimeout(hideCardsTimer);
   hideCardsTimer = setTimeout(() => {
@@ -29,7 +28,11 @@ el("btnPlay").addEventListener("click", async () => {
   }, 10 * 60 * 1000);
 });
 
-el("btnStop").addEventListener("click", () => invoke("stop_bot"));
+el("btnStop").addEventListener("click", async () => {
+  el("btnStop").disabled = true;
+  try { await invoke("stop_bot"); }
+  finally { await syncStatus(); }
+});
 el("btnSettings").addEventListener("click", () => invoke("open_colour_window"));
 el("btnCastKey").addEventListener("click", () => el("castKeyInput").focus());
 
@@ -44,7 +47,21 @@ function setButtonStates(playEnabled) {
 }
 
 /* bot 线程退出（对应 C# BotThread 末尾 SetButtonStates(true)） */
-listen("bot-stopped", () => setButtonStates(true));
+function applyStatus(status) {
+  setButtonStates(status.phase === "Idle");
+  if (status.phase === "Stopping") el("btnStop").disabled = true;
+  if (chart) chart.setStrikeValue(status.strike_value);
+}
+
+async function syncStatus() { applyStatus(await invoke("bot_status")); }
+listen("bot-status", () => syncStatus());
+listen("bot-stopped", () => {
+  if (hideCardsTimer) clearTimeout(hideCardsTimer);
+  hideCardsTimer = null;
+  lootingOverlay.classList.add("hidden");
+  if (fish) fish.stop();
+  syncStatus();
+});
 
 /* ---------------- Flipper ---------------- */
 
@@ -67,7 +84,7 @@ listen("frame", ev => {
   }
 });
 
-/* ---------------- 钓鱼事件（规格 §9 对照表） ---------------- */
+/* ---------------- 钓鱼事件（见仓库 docs/architecture.md） ---------------- */
 
 listen("fishing-event", ev => {
   const { action, amplitude } = ev.payload;
@@ -109,6 +126,7 @@ listen("log", ev => {
   msg.textContent = ev.payload;
   row.append(time, idx, msg);
   logList.prepend(row);
+  while (logList.childElementCount > 500) logList.lastElementChild.remove();
 });
 
 /* ---------------- 按键绑定（KeyBindChooser 复刻） ---------------- */
@@ -148,4 +166,5 @@ window.addEventListener("DOMContentLoaded", () => {
   fish = new FlyingFish(el("fishLayer"));
   // C# SizeChanged 防抖后 flipper 最终停在正面 —— 初始即正面，无需动作
   setButtonStates(true);
+  syncStatus();
 });

@@ -42,6 +42,17 @@ pub trait KeySender {
 /// 鼠标能力（对应 WowProcess.RightClickMouse 等）。
 pub trait MouseController {
     fn right_click_at(&mut self, position: Point);
+
+    /// 平台实现可进一步在拾取前等待期间响应取消。
+    fn right_click_cancellable(
+        &mut self,
+        position: Point,
+        cancel: &crate::cancellation::CancellationToken,
+    ) {
+        if !cancel.is_cancelled() {
+            self.right_click_at(position);
+        }
+    }
 }
 
 /// 可投递的按键。对应 C# ConsoleKey：其枚举数值与 Win32 VK 码一致，

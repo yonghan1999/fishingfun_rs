@@ -1,9 +1,9 @@
-/* 颜色配置窗口逻辑 — ColourConfiguration.xaml.cs 复刻（规格 docs/07 §8）
+/* 颜色配置窗口逻辑 — ColourConfiguration.xaml.cs 复刻（当前行为见仓库 docs/ui.md）
  * 两阶段行为：滑条拖动中（input）只更新文字/立方图；
  * 拖动结束（change，对应 Thumb.DragCompleted）才描边 + 重算截图高亮。
- * 扩展：点击截图取色、咬钩判定阈值可调（见 migration/logs/F2）。 */
+ * 扩展：点击截图取色、咬钩判定阈值可调（见仓库 docs/ui.md）。 */
 
-const { invoke } = window.__TAURI__.core;
+const invoke = window.invokeWithFeedback;
 const el = id => document.getElementById(id);
 
 let mode = "Red";               // ClassifierMode
@@ -239,12 +239,14 @@ async function pushParams() {
   });
 }
 
-/* 咬钩判定阈值：拖动中实时保存（下次开始时生效） */
+/* 拖动只更新说明，结束后写盘；实际阈值在下次开始时生效。 */
 el("strikeValue").addEventListener("input", () => {
   const v = parseInt(el("strikeValue").value, 10);
-  el("labelStrike").textContent = `咬钩判定：浮漂下沉 ${v} 像素时提竿（海水起伏大时调大）`;
-  invoke("set_strike_value", { v });
+  el("labelStrike").textContent = `下次启动：浮漂下沉 ${v} 像素时提竿（海水起伏大时调大）`;
 });
+el("strikeValue").addEventListener("change", () => invoke("set_strike_value", {
+  v: parseInt(el("strikeValue").value, 10),
+}));
 
 /* Capture Screen：重新截屏并全量渲染 */
 el("btnCapture").addEventListener("click", async () => {
@@ -291,7 +293,7 @@ el("lootDelay").addEventListener("input", () => {
   el("cmbColors").value = mode;
   el("lootDelay").value = await invoke("get_loot_delay");
   el("strikeValue").value = await invoke("get_strike_value");
-  el("labelStrike").textContent = `咬钩判定：浮漂下沉 ${el("strikeValue").value} 像素时提竿（海水起伏大时调大）`;
+  el("labelStrike").textContent = `下次启动：浮漂下沉 ${el("strikeValue").value} 像素时提竿（海水起伏大时调大）`;
   // 恢复上次框选的水面搜索区域
   const saved = await invoke("get_search_region");
   if (saved) region = { x: saved.x, y: saved.y, w: saved.width, h: saved.height };

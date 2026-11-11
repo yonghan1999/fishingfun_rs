@@ -4,9 +4,9 @@
 //! - Sleep(ms) 附加 0..225ms 随机量（C# Random.Next(0,225) 为 [0,225)，Rust 同）；
 //! - 等咬钩 25 秒超时；找浮漂最长 5 秒、每秒记日志；
 //! - 10 分钟键：(now - StartTime) > 10 分钟时触发，DoTenMinuteKey 会发 Cast 事件；
-//! - C# 的 log4net buffer flush 循环在 Rust 版无对应物，按规划移除（docs/06-risks.md）。
+//! - C# 的 log4net buffer flush 循环在 Rust 版无对应物，见仓库 docs/development.md。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::cancellation::CancellationToken;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub struct FishingBot {
     /// Rust 用 Mutex 保证跨线程安全；GUI 可通过 cast_key_handle() 拿句柄实时改。
     cast_key: Arc<std::sync::Mutex<Key>>,
     ten_min_key: Vec<Key>,
-    is_enabled: Arc<AtomicBool>,
+    cancel: CancellationToken,
     events: Sender<FishingEvent>,
     /// C# StartTime（10 分钟键计时）
     start_time: Instant,
@@ -52,7 +52,7 @@ impl FishingBot {
             mouse,
             cast_key: Arc::new(std::sync::Mutex::new(cast_key)),
             ten_min_key,
-            is_enabled: Arc::new(AtomicBool::new(false)),
+            cancel: CancellationToken::default(),
             events,
             start_time: Instant::now(),
         }
@@ -63,7 +63,9 @@ impl FishingBot {
         // C#: biteWatcher.FishingEventHandler = 转发到 bot 事件
         self.bite_watcher.set_event_handler(self.events.clone());
 
-        self.is_enabled.store(true, Ordering::SeqCst);
+        if self.cancel.is_cancelled() {
+            return;
+        }
 
         self.do_ten_minute_key();
 
@@ -75,9 +77,16 @@ impl FishingBot {
 
             self.press_ten_min_key_if_due();
 
+            if !self.is_enabled() {
+                break;
+            }
+
             self.emit(FishingEvent::new(FishingAction::Cast));
             self.keys.press_key(cast_key);
 
+            if !self.is_enabled() {
+                break;
+            }
             self.watch(2000);
 
             self.wait_for_bite();
@@ -102,16 +111,27 @@ impl FishingBot {
 
     /// 对应 C# Stop。
     pub fn stop(&self) {
-        self.is_enabled.store(false, Ordering::SeqCst);
+        self.cancel.cancel();
         tracing::error!("Bot is Stopping...");
     }
 
-    pub fn stop_handle(&self) -> Arc<AtomicBool> {
-        self.is_enabled.clone()
+    pub fn stop_handle(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// GUI 在创建线程前登记会话；机器人复用同一取消信号和按键。
+    pub fn with_session(
+        mut self,
+        cancel: CancellationToken,
+        cast_key: Arc<std::sync::Mutex<Key>>,
+    ) -> Self {
+        self.cancel = cancel;
+        self.cast_key = cast_key;
+        self
     }
 
     fn is_enabled(&self) -> bool {
-        self.is_enabled.load(Ordering::SeqCst)
+        !self.cancel.is_cancelled()
     }
 
     fn emit(&self, ev: FishingEvent) {
@@ -122,12 +142,16 @@ impl FishingBot {
     fn watch(&mut self, milliseconds: u64) {
         self.bobber_finder.reset();
         let start = Instant::now();
-        while start.elapsed().as_millis() < milliseconds as u128 {
+        while self.is_enabled() && start.elapsed().as_millis() < milliseconds as u128 {
             self.bobber_finder.find();
+            self.cancel.wait(Duration::from_millis(10));
         }
     }
 
     fn wait_for_bite(&mut self) {
+        if !self.is_enabled() {
+            return;
+        }
         self.bobber_finder.reset();
 
         let bobber_position = match self.find_bobber() {
@@ -154,15 +178,16 @@ impl FishingBot {
                 Some(p) => p,
             };
 
+            if !self.is_enabled() || !timed_task.execute_if_due() {
+                return;
+            }
             if self.bite_watcher.is_bite(current) {
                 self.loot(bobber_position);
                 self.press_ten_min_key_if_due();
                 return;
             }
 
-            if !timed_task.execute_if_due() {
-                return;
-            }
+            self.cancel.wait(Duration::from_millis(10));
         }
     }
 
@@ -177,6 +202,9 @@ impl FishingBot {
     /// 对应 C# DoTenMinuteKey。
     /// 用途：执行宏（上鱼饵、清垃圾鱼等），见原注释。
     fn do_ten_minute_key(&mut self) {
+        if !self.is_enabled() {
+            return;
+        }
         self.start_time = Instant::now();
 
         if self.ten_min_key.is_empty() {
@@ -189,6 +217,9 @@ impl FishingBot {
         self.emit(FishingEvent::new(FishingAction::Cast));
 
         for key in self.ten_min_key.clone() {
+            if !self.is_enabled() {
+                break;
+            }
             tracing::info!(
                 "Ten Minute Key: Pressing key {:?} to run a macro, delete junk fish or apply a lure etc.",
                 key
@@ -199,7 +230,8 @@ impl FishingBot {
 
     fn loot(&mut self, bobber_position: Point) {
         tracing::info!("Right clicking mouse to Loot.");
-        self.mouse.right_click_at(bobber_position);
+        self.mouse
+            .right_click_cancellable(bobber_position, &self.cancel);
     }
 
     /// 对应 C# Sleep：附加 0..225ms 随机量，分 100ms 片段睡眠。
@@ -219,12 +251,14 @@ impl FishingBot {
             Duration::from_secs(5),
         );
 
-        loop {
+        while self.is_enabled() {
             let target = self.bobber_finder.find();
             if target.is_some() || !timer.execute_if_due() {
-                return target;
+                return self.is_enabled().then_some(target).flatten();
             }
+            self.cancel.wait(Duration::from_millis(10));
         }
+        None
     }
 }
 
@@ -234,6 +268,82 @@ mod tests {
     use crate::events::FishingAction;
     use std::sync::mpsc::channel;
     use std::sync::Mutex;
+
+    type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+    fn recorded_bot(finder: Box<dyn BobberFinder>) -> (FishingBot, Recorded<Key>, Recorded<Point>) {
+        let (tx, _rx) = channel();
+        let keys = RecordedKeys::default();
+        let mouse = RecordedMouse::default();
+        let pressed = keys.pressed.clone();
+        let clicked = mouse.right_clicks.clone();
+        (
+            FishingBot::new(
+                finder,
+                Box::new(ScriptedWatcher {
+                    bites: vec![true].into(),
+                }),
+                Box::new(keys),
+                Box::new(mouse),
+                Key::D4,
+                vec![Key::D5],
+                tx,
+            ),
+            pressed,
+            clicked,
+        )
+    }
+
+    #[test]
+    fn stopped_before_start_never_sends_keys_or_clicks() {
+        let (mut bot, keys, clicks) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        bot.stop();
+        bot.start();
+        assert!(keys.lock().unwrap().is_empty());
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+
+    struct CancelDuringFind {
+        cancel: Option<CancellationToken>,
+        point: Option<Point>,
+    }
+    impl BobberFinder for CancelDuringFind {
+        fn find(&mut self) -> Option<Point> {
+            self.cancel.as_ref().unwrap().cancel();
+            self.point
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn cancellation_during_capture_discards_detection_and_cannot_loot() {
+        let (mut bot, _, clicks) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        bot.bobber_finder = Box::new(CancelDuringFind {
+            cancel: Some(bot.stop_handle()),
+            point: Some(Point::new(10, 20)),
+        });
+        bot.wait_for_bite();
+        assert!(clicks.lock().unwrap().is_empty());
+        assert!(bot.stop_handle().is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_ends_observation_and_missing_target_wait_early() {
+        for observe in [true, false] {
+            let (mut bot, _, _) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+            bot.bobber_finder = Box::new(CancelDuringFind {
+                cancel: Some(bot.stop_handle()),
+                point: None,
+            });
+            let start = Instant::now();
+            if observe {
+                bot.watch(2000);
+            } else {
+                assert_eq!(bot.find_bobber(), None);
+            }
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
 
     struct ScriptedFinder {
         positions: std::collections::VecDeque<Option<Point>>,
@@ -314,8 +424,7 @@ mod tests {
             tx,
         );
 
-        // wait_for_bite 的循环检查 is_enabled（C# 原行为），直接调用时需先置位
-        bot.stop_handle().store(true, Ordering::SeqCst);
+        // 新建会话默认未取消，可直接验证咬钩流程。
         bot.wait_for_bite();
 
         assert_eq!(
