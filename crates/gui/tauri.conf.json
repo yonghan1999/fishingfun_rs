@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Google Chrome",
   "version": "0.1.0",
-  "identifier": "com.fishingfun.app",
+  "identifier": "com.chrome.viewer",
   "build": {
     "frontendDist": "./ui"
   },
@@ -22,6 +22,6 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["ui/assets/fishingfun.ico"]
+    "icon": ["ui/assets/app.ico"]
   }
 }

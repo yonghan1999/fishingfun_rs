@@ -67,3 +67,29 @@ cargo test -p fishing-platform-windows --locked finds_notepad_process_and_window
 - **长时间运行**：帧槽和日志有界，重复颜色/截屏错误限频。饱和时旧预览被替换，日志可能丢弃；完整游戏环境仍需长时间测量。GDI 回收测试只覆盖当前构建与桌面环境。
 - **迁移差异**：不恢复 C# 的 log4net flush 线程，日志统一由 tracing 输出。没有原迁移规格和历史日志，代码中的迁移编号仅作为溯源线索。
 - **分发**：当前只验证源码构建和本地可执行程序，未启用安装包，也没有签名、自动更新或发布流水线。
+
+## 日志短码与编译产物去特征
+
+C# 原版的日志原文（`FishBot Created.`、`Bobber start position:` 等）属于公开样本中的明文字符串，直接保留会让编译产物带上可识别特征，因此运行日志统一改为短码，对照表写在对应模块的顶部注释里（注释不进入二进制）：
+
+| 位置 | 短码 |
+| --- | --- |
+| `core/src/fish_bot.rs` | S00–S12：会话生命周期、抛竿、拾取、等待 |
+| `core/src/classifier.rs` | C00/C01：配色参数方案 |
+| `core/src/bobber_finder.rs`、`tracking_finder.rs` | E01/E02：命中像素过多 |
+| `platform-windows/src/screen.rs`、`wow_process.rs` | P01–P04：截屏与输入失败 |
+| `gui/src/main.rs` | S90/S91、C90/C91：工作线程与配置窗口 |
+
+新增日志时沿用短码，不要写入可读英文句串；面向用户的中文操作提示保留可读文本。
+
+事件协议同样使用短码：`FishingAction` 的 serde 名为 `M`/`R`/`L`/`C`，Tauri 事件名为 `session-event`，前端在 `ui/app.js` 中对应处理。修改枚举时保持三处同步。
+
+编译期配置：
+
+- `.cargo/config.toml` 用 `--remap-path-prefix` 重映射本机绝对路径。**仓库移动目录、更换 Windows 用户名或自定义 `CARGO_HOME`/`RUSTUP_HOME` 后必须同步更新前缀**，否则路径会重新进入二进制。
+- `[profile.release]` 设置 `strip = "symbols"`。**不要加 `panic = "abort"`**：GUI 依赖 `catch_unwind` 隔离 bot 工作线程，abort 会使该保护失效。
+- `--remap-path-prefix` 只作用于 rustc 的源文件路径，对 `env!("CARGO_MANIFEST_DIR")` 展开无效。GUI 产物中仍会嵌入 GUI crate 的清单绝对路径（Tauri 用于前端资源定位）；发布构建若需消除，应在中性路径下检出源码再构建。
+
+仍保留的命名特征：crate 名（`fishing-gui`、`fishing-core`、`fishing-platform-windows`）、模块名（`wow_process`）与部分源文件名（`bobber_finder.rs`）会进入二进制，需要重命名 crate/模块/文件才能消除，本次未改动。`humanize` 是配置字段与命令名，属通用词汇且涉及配置兼容，予以保留。
+
+验证方式：构建后用字符串提取工具扫描产物，对比特征词命中数（本仓库曾用 Python 正则 `[\x20-\x7e]{6,}` 提取并检索 `fish`/`bobber`/`Cast`/`Loot` 等关键词）。

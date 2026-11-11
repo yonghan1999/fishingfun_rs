@@ -1,0 +1,15 @@
+# 编译产物去特征：重映射嵌入二进制中的本机绝对路径。
+#
+# rustc 会把源文件路径写进 panic Location、module_path!() 等位置，
+# 例如 `D:\claude\fishingfun_rs\crates\gui` 和 `.cargo\registry` 下的用户名。
+# 这些路径与代码里的字符串字面量无关，无法靠修改源码去除，只能在编译期重映射。
+#
+# 注意：以下前缀是本机绝对路径。仓库移动目录、更换 Windows 用户名或
+# 自定义 CARGO_HOME / RUSTUP_HOME 后，需要同步更新，否则路径会重新泄露。
+# 在 CI 或其他机器上构建时同样如此。
+[build]
+rustflags = [
+    '--remap-path-prefix=D:\claude\fishingfun_rs=/app',
+    '--remap-path-prefix=C:\Users\Worker\.cargo=/cargo',
+    '--remap-path-prefix=C:\Users\Worker\.rustup=/rustup',
+]

@@ -8,7 +8,7 @@ class FlyingFish {
     this.timer = null;
     for (let i = 0; i < 30; i++) {
       const img = document.createElement("img");
-      img.src = "assets/FishingFunLogo.png";
+      img.src = "assets/logo.png";
       img.style.display = "none";
       layer.appendChild(img);
       this.fishes.push({

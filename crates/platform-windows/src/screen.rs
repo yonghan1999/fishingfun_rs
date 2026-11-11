@@ -129,7 +129,8 @@ impl WowScreenCapture {
                     std::sync::Mutex::new(None);
                 if let Ok(mut last) = LAST_ERROR.lock() {
                     if last.is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(5)) {
-                        tracing::error!("截屏失败: {e:#}");
+                        // P01 = 截屏失败（限频 5 秒）
+                        tracing::error!("P01 {e:#}");
                         *last = Some(std::time::Instant::now());
                     }
                 }

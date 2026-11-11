@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.1.0.0" name="FishingFun.Console" type="win32"/>
+  <assemblyIdentity version="0.1.0.0" name="Screen.Tool" type="win32"/>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <!-- 与 WinForms 原版对齐：系统级 DPI 感知，保证截屏坐标为物理像素 -->

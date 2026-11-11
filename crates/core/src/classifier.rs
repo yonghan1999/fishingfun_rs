@@ -49,11 +49,12 @@ impl PixelClassifier {
     /// 对应 SetConfiguration(bool isWowClasic)。
     pub fn set_configuration(&mut self, is_wow_classic: bool) {
         if is_wow_classic {
-            tracing::info!("Wow Classic configuration");
+            // C00 = 怀旧服配色参数，C01 = 正式服默认参数
+            tracing::info!("C00");
             self.colour_multiplier = 1.0;
             self.colour_closeness_multiplier = 1.0;
         } else {
-            tracing::info!("Wow Standard configuration");
+            tracing::info!("C01");
         }
     }
 

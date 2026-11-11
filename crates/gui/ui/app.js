@@ -87,26 +87,27 @@ listen("frame", ev => {
 
 /* ---------------- 钓鱼事件（见仓库 docs/architecture.md） ---------------- */
 
-listen("fishing-event", ev => {
+listen("session-event", ev => {
   const { action, amplitude } = ev.payload;
+  // 短码协议：M=浮漂移动 R=复位 L=拾取 C=抛竿（对应 FishingAction 的 serde rename）
   switch (action) {
-    case "BobberMove":
+    case "M":
       // C#：仅 Flipper 正面时加点
       if (!el("graphFlipper").classList.contains("flipped")) {
         chart.add(amplitude);
       }
       break;
-    case "Loot":
+    case "L":
       fish.start(previewArea.clientWidth, previewArea.clientHeight);
       lootingOverlay.classList.remove("hidden");
       break;
-    case "Cast":
+    case "C":
       chart.clearChart();
       lootingOverlay.classList.add("hidden");
       fish.stop();
       setImageBackgroundColour = true;
       break;
-    case "Reset":
+    case "R":
       break; // 原版 UI 无直接反应
   }
 });

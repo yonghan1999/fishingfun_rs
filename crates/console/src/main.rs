@@ -20,10 +20,7 @@ use fishing_platform_windows::{
 
 /// FishingFun console（对应 C# Console 版；原发布名为 powershell.exe 属伪装 quirk）。
 #[derive(Parser, Debug)]
-#[command(
-    name = "fishing-console",
-    about = "FishingFun WoW 钓鱼机器人（控制台版）"
-)]
+#[command(name = "fishing-console", about = "屏幕取色自动化（控制台版）")]
 struct Args {
     /// 使用蓝色羽毛模式（对应 C# args.Contains("blue")）
     #[arg(long)]

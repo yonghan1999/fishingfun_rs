@@ -56,7 +56,7 @@ GUI 的产品名和窗口标题是 `Google Chrome`；用 `& "./package.ps1"` 构
 
 ## 配置与使用边界
 
-GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPDATA%/com.fishingfun.app/settings.json`，不受启动工作目录影响：
+GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPDATA%/com.chrome.viewer/settings.json`，不受启动工作目录影响。早期版本使用 `com.fishingfun.app` 标识；为避免在程序中保留旧标识字符串，应用不做自动迁移，需要沿用旧设置时可手动把旧目录的 `settings.json` 复制到新目录。
 
 | JSON 字段 | 内容 | 默认值 |
 | --- | --- | --- |

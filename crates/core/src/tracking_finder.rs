@@ -239,9 +239,8 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
                 .last_colour_warning
                 .is_none_or(|time| time.elapsed() >= Duration::from_secs(5))
             {
-                tracing::warn!(
-                    "Too many feather-colour pixels in search area; adjust colour settings"
-                );
+                // E02 = 搜索区域内命中像素过多（限频 5 秒）
+                tracing::warn!("E02");
                 self.last_colour_warning = Some(Instant::now());
             }
             points.clear();

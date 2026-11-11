@@ -47,7 +47,7 @@ Tauri 后端通过 `AppState` 共享分类器、搜索区域及机器人句柄�
 | 事件 | 内容 | 前端用途 |
 | --- | --- | --- |
 | `frame` | PNG Base64、匹配高亮和准星、平均色、浮漂位图坐标 | 截图预览 |
-| `fishing-event` | Cast、Reset、BobberMove、Loot，含幅度 | 清图、曲线、拾取动画 |
+| `session-event` | 短码 C、R、M、L（依次对应 Cast、Reset、BobberMove、Loot），含幅度 | 清图、曲线、拾取动画 |
 | `log` | tracing 文本 | 日志列表 |
 | `bot-stopped` | 机器人退出通知 | 恢复按钮状态 |
 | `bot-status` | 状态变更通知，前端重新调用 `bot_status` | 当前状态和实际生效阈值 |

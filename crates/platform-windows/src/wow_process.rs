@@ -8,6 +8,11 @@
 //!
 //! 有意偏离 C#：输入注入从 PostMessage/ mouse_event 迁移到 SendInput。
 //! SendInput 进入系统输入流，由前台窗口接收；仍属于可识别的注入输入。
+//!
+//! 日志短码对照（注释不进入二进制）：
+//!   P02 未找到目标进程（已尝试的进程名）
+//!   P03 按键注入被系统拒绝（UIPI 权限隔离）
+//!   P04 鼠标注入被系统拒绝
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -60,10 +65,7 @@ pub fn find_wow_process(extra_name: Option<&str>) -> Option<WowProcess> {
             })
         }
         None => {
-            tracing::error!(
-                "Failed to find the wow process, tried: {}",
-                names.join(", ")
-            );
+            tracing::error!("P02 {}", names.join(", "));
             None
         }
     }
@@ -284,7 +286,7 @@ fn send_key(key: Key, key_up: bool) -> InputResult {
     };
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent != 1 {
-        tracing::error!("SendInput 按键 {:?} 被系统拦截（UIPI 权限隔离?）", key);
+        tracing::error!("P03 {:?}", key);
         return Err(InputError::Rejected);
     }
     Ok(())
@@ -307,7 +309,7 @@ fn send_mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> InputResult {
     };
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent != 1 {
-        tracing::error!("SendInput 鼠标事件被系统拦截");
+        tracing::error!("P04");
         return Err(InputError::Rejected);
     }
     Ok(())

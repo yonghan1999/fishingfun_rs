@@ -45,3 +45,8 @@ windows = { version = "0.58", features = [
 [profile.release]
 lto = true
 codegen-units = 1
+# 剥离符号表，减少函数名等元数据残留（对字符串字面量无效，见 .cargo/config.toml）。
+strip = "symbols"
+debug = false
+# 不设置 panic = "abort"：GUI 依赖 catch_unwind 隔离 bot 工作线程的 panic，
+# abort 会让该保护失效并使整个进程直接终止。

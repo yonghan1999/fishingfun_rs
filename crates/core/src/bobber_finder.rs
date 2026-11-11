@@ -117,9 +117,8 @@ impl<C: ScreenCapture> SearchBobberFinder<C> {
         }
 
         if points.len() > 1000 {
-            tracing::error!(
-                "Error: Too much of the feather colour in this image, please adjust the colour configuration !"
-            );
+            // E01 = 命中像素过多，需调整颜色分类参数
+            tracing::error!("E01");
             points.clear();
             mask.fill(false);
         }

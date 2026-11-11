@@ -5,6 +5,16 @@
 //! - 等咬钩 25 秒超时；找浮漂最长 5 秒、每秒记日志；
 //! - 10 分钟键：(now - StartTime) > 10 分钟时触发，DoTenMinuteKey 会发 Cast 事件；
 //! - C# 的 log4net buffer flush 循环在 Rust 版无对应物，见仓库 docs/development.md。
+//!
+//! 运行日志使用短码而非可读句子：C# 原版的日志原文属于公开样本中的明文特征，
+//! 直接保留会让编译产物带上可识别的字符串。对照表（注释不进入二进制）：
+//!   S00 会话已创建            S01 达到最长运行时长，自动停止
+//!   S02 周期休息（秒）         S03 抛竿按键
+//!   S04 会话已停止            S05 会话正在停止
+//!   S06 输入失败，会话终止     S07 目标起始坐标
+//!   S08 等待超时              S09 宏键列表为空
+//!   S10 宏键                  S11 右键拾取
+//!   S12 等待目标秒数
 
 use crate::cancellation::CancellationToken;
 use std::sync::mpsc::Sender;
@@ -50,7 +60,7 @@ impl FishingBot {
         ten_min_key: Vec<Key>,
         events: Sender<FishingEvent>,
     ) -> Self {
-        tracing::info!("FishBot Created.");
+        tracing::info!("S00");
         FishingBot {
             bobber_finder,
             bite_watcher,
@@ -84,13 +94,13 @@ impl FishingBot {
         while self.is_enabled() {
             // 拟人化：最长会话时长（0 = 不限）
             if self.humanizer.session_expired() {
-                tracing::info!("已达到最长运行时长，自动停止。");
+                tracing::info!("S01");
                 break;
             }
 
             // 拟人化：周期性休息（取消可中断休息）
             if let Some(rest) = self.humanizer.break_due() {
-                tracing::info!("拟人化休息 {} 秒。", rest.as_secs());
+                tracing::info!("S02 {}", rest.as_secs());
                 if !self.cancel.wait(rest) {
                     break;
                 }
@@ -99,7 +109,7 @@ impl FishingBot {
             // C# try/catch：平台层错误在 Rust 版由各实现内部记日志并容错，
             // 不再以异常形式上抛（WowProcess.Get 找不到进程即跳过）。
             let cast_key = self.cast_key();
-            tracing::info!("Pressing key {:?} to Cast.", cast_key);
+            tracing::info!("S03 {:?}", cast_key);
 
             self.press_ten_min_key_if_due();
 
@@ -128,9 +138,9 @@ impl FishingBot {
         }
 
         if self.humanizer.session_expired() {
-            tracing::info!("已达到最长运行时长，自动停止。");
+            tracing::info!("S01");
         }
-        tracing::info!("Bot has Stopped.");
+        tracing::info!("S04");
     }
 
     /// 对应 C# SetCastKey（UI 线程调用，bot 运行中实时生效）。
@@ -150,7 +160,7 @@ impl FishingBot {
     /// 对应 C# Stop。
     pub fn stop(&self) {
         self.cancel.cancel();
-        tracing::error!("Bot is Stopping...");
+        tracing::error!("S05");
     }
 
     pub fn stop_handle(&self) -> CancellationToken {
@@ -188,7 +198,7 @@ impl FishingBot {
             Ok(()) => true,
             Err(error) => {
                 if error != InputError::Cancelled {
-                    tracing::error!("输入失败，已停止本次会话：{error}");
+                    tracing::error!("S06 {error}");
                     self.last_error = Some(error);
                 }
                 self.cancel.cancel();
@@ -225,10 +235,10 @@ impl FishingBot {
 
         self.bite_watcher.reset(bobber_position);
 
-        tracing::info!("Bobber start position: {}", bobber_position);
+        tracing::info!("S07 {}", bobber_position);
 
         let mut timed_task = TimedAction::with_system_clock(
-            |_| tracing::info!("Fishing timed out!"),
+            |_| tracing::info!("S08"),
             Duration::from_millis(25 * 1000),
             Duration::from_secs(25),
         );
@@ -280,19 +290,14 @@ impl FishingBot {
         self.humanizer.resample_ten_min();
 
         if self.ten_min_key.is_empty() {
-            tracing::info!(
-                "Ten Minute Key:  No keys defined in tenMinKey, so nothing to do (Define in call to FishingBot constructor)."
-            );
+            tracing::info!("S09");
         }
 
         for key in self.ten_min_key.clone() {
             if !self.is_enabled() {
                 break;
             }
-            tracing::info!(
-                "Ten Minute Key: Pressing key {:?} to run a macro, delete junk fish or apply a lure etc.",
-                key
-            );
+            tracing::info!("S10 {:?}", key);
             let result = self.keys.press_key_cancellable(key, &self.cancel);
             if !self.handle_input(result) {
                 return;
@@ -305,7 +310,7 @@ impl FishingBot {
     }
 
     fn loot(&mut self, bobber_position: Point) {
-        tracing::info!("Right clicking mouse to Loot.");
+        tracing::info!("S11");
         let result = self
             .mouse
             .right_click_cancellable(bobber_position, &self.cancel);
@@ -326,7 +331,7 @@ impl FishingBot {
     /// 对应 C# FindBobber：每秒记一次日志，最多等 5 秒。
     fn find_bobber(&mut self) -> Option<Point> {
         let mut timer = TimedAction::with_system_clock(
-            |elapsed| tracing::info!("Waited seconds for target: {}", elapsed),
+            |elapsed| tracing::info!("S12 {}", elapsed),
             Duration::from_millis(1000),
             Duration::from_secs(5),
         );

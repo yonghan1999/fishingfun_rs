@@ -2,6 +2,9 @@
 //! 职责：bot 线程生命周期管理、预览帧/钓鱼事件/日志 → 前端事件桥接、
 //! 分类器参数共享、配置持久化与旧版文本配置迁移。
 //! 当前界面行为与配置见仓库 docs/ui.md。
+//!
+//! 运行期错误日志使用短码（S90 工作线程异常、S91 桥接线程异常、C90 配置窗口已打开），
+//! 避免二进制携带可识别的英文句串；面向用户的中文操作提示保持可读。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -70,6 +73,8 @@ impl std::io::Write for LogWriter {
 #[derive(Serialize, Clone)]
 struct FramePayload {
     png_b64: String,
+    /// 浮漂位图坐标；前端未消费该字段，序列化名用短码避免命名进入二进制。
+    #[serde(rename = "p")]
     bobber: Option<Point>,
     /// 首帧平均色（预览区背景，对应 BitmapExtension.GetBackgroundColourBrush）
     avg_colour: [u8; 3],
@@ -258,7 +263,7 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                         if event_cancel.is_cancelled() {
                             break;
                         }
-                        let _ = ev_app.emit("fishing-event", ev);
+                        let _ = ev_app.emit("session-event", ev);
                     }
                 }));
                 let mut finder = TrackingBobberFinder::new_shared(
@@ -294,11 +299,11 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
             // panic 展开同样会释放生产端；标记会话结束前必须回收桥接线程。
             for worker in [frame_thread, event_thread].into_iter().flatten() {
                 if worker.join().is_err() {
-                    tracing::error!("会话桥接线程异常退出");
+                    tracing::error!("S91");
                 }
             }
             if result.is_err() {
-                tracing::error!("Bot worker panicked");
+                tracing::error!("S90");
                 let _ = app2.emit("bot-error", "机器人异常退出，请查看日志");
             }
             if let Some(state) = app2.try_state::<AppState>() {
@@ -501,8 +506,8 @@ fn spawn_colour_window(app: &AppHandle) -> Result<(), String> {
         .always_on_top(true)
         .focused(true)
         .build()
-        .map_err(|e| format!("create colour window '{label}': {e}"))?;
-    tracing::info!("colour window '{label}' opened");
+        .map_err(|e| format!("C91 {label}: {e}"))?;
+    tracing::info!("C90");
     Ok(())
 }
 
