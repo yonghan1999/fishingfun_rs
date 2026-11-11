@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::events::{FishingAction, FishingEvent};
+use crate::humanize::{Humanizer, HumanizerConfig};
 use crate::timed_action::TimedAction;
 use crate::traits::{BiteWatcher, BobberFinder, Key, KeySender, MouseController};
 use crate::Point;
@@ -32,6 +33,8 @@ pub struct FishingBot {
     events: Sender<FishingEvent>,
     /// C# StartTime（10 分钟键计时）
     start_time: Instant,
+    /// 拟人化节奏（扩展功能；默认关闭，保持 C# 保真节拍）
+    humanizer: Humanizer,
 }
 
 impl FishingBot {
@@ -55,6 +58,7 @@ impl FishingBot {
             cancel: CancellationToken::default(),
             events,
             start_time: Instant::now(),
+            humanizer: Humanizer::disabled(),
         }
     }
 
@@ -70,6 +74,20 @@ impl FishingBot {
         self.do_ten_minute_key();
 
         while self.is_enabled() {
+            // 拟人化：最长会话时长（0 = 不限）
+            if self.humanizer.session_expired() {
+                tracing::info!("已达到最长运行时长，自动停止。");
+                break;
+            }
+
+            // 拟人化：周期性休息（取消可中断休息）
+            if let Some(rest) = self.humanizer.break_due() {
+                tracing::info!("拟人化休息 {} 秒。", rest.as_secs());
+                if !self.cancel.wait(rest) {
+                    break;
+                }
+            }
+
             // C# try/catch：平台层错误在 Rust 版由各实现内部记日志并容错，
             // 不再以异常形式上抛（WowProcess.Get 找不到进程即跳过）。
             let cast_key = self.cast_key();
@@ -90,6 +108,12 @@ impl FishingBot {
             self.watch(2000);
 
             self.wait_for_bite();
+
+            // 拟人化：每轮之间的随机停顿（取消可中断）
+            let pause = self.humanizer.between_casts_delay();
+            if !pause.is_zero() && !self.cancel.wait(pause) {
+                break;
+            }
         }
 
         tracing::error!("Bot has Stopped.");
@@ -127,6 +151,12 @@ impl FishingBot {
     ) -> Self {
         self.cancel = cancel;
         self.cast_key = cast_key;
+        self
+    }
+
+    /// 拟人化节奏（扩展功能）；默认关闭以保持 C# 保真节拍。
+    pub fn with_humanizer(mut self, cfg: HumanizerConfig) -> Self {
+        self.humanizer = Humanizer::new(cfg);
         self
     }
 
@@ -182,6 +212,11 @@ impl FishingBot {
                 return;
             }
             if self.bite_watcher.is_bite(current) {
+                // 拟人化：人的反应需要时间，延迟期间取消则放弃本次拾取
+                let delay = self.humanizer.reaction_delay();
+                if !delay.is_zero() && !self.cancel.wait(delay) {
+                    return;
+                }
                 self.loot(bobber_position);
                 self.press_ten_min_key_if_due();
                 return;
@@ -191,9 +226,10 @@ impl FishingBot {
         }
     }
 
-    /// 对应 C# PressTenMinKeyIfDue。
+    /// 对应 C# PressTenMinKeyIfDue；周期含拟人化抖动（默认配置下 600..=690s）。
     fn press_ten_min_key_if_due(&mut self) {
-        if self.start_time.elapsed() > Duration::from_secs(10 * 60) && !self.ten_min_key.is_empty()
+        if self.start_time.elapsed() > self.humanizer.ten_min_period()
+            && !self.ten_min_key.is_empty()
         {
             self.do_ten_minute_key();
         }
@@ -206,6 +242,7 @@ impl FishingBot {
             return;
         }
         self.start_time = Instant::now();
+        self.humanizer.resample_ten_min();
 
         if self.ten_min_key.is_empty() {
             tracing::info!(
@@ -530,5 +567,89 @@ mod tests {
         bot.do_ten_minute_key();
         let actions: Vec<_> = rx.try_iter().map(|e| e.action).collect();
         assert_eq!(actions, vec![FishingAction::Cast]);
+    }
+
+    // ---------------------------------------------------------------- 拟人化
+
+    fn humanized_bot(cfg: HumanizerConfig) -> (FishingBot, Recorded<Point>) {
+        let (tx, _rx) = channel();
+        let bobber = Point::new(960, 540);
+        let mouse = RecordedMouse::default();
+        let clicks = mouse.right_clicks.clone();
+        (
+            FishingBot::new(
+                Box::new(ScriptedFinder::new(
+                    vec![Some(bobber), Some(bobber)],
+                    Some(bobber),
+                )),
+                Box::new(ScriptedWatcher {
+                    bites: vec![true].into(),
+                }),
+                Box::new(RecordedKeys::default()),
+                Box::new(mouse),
+                Key::D4,
+                vec![],
+                tx,
+            )
+            .with_humanizer(cfg),
+            clicks,
+        )
+    }
+
+    #[test]
+    fn humanizer_disabled_by_default_keeps_fidelity_timing() {
+        let (bot, _, _) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        assert_eq!(bot.humanizer.ten_min_period(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn reaction_delay_applies_before_loot() {
+        let (mut bot, clicks) = humanized_bot(HumanizerConfig {
+            reaction_ms: (120, 120),
+            ..HumanizerConfig::disabled()
+        });
+        let start = Instant::now();
+        bot.wait_for_bite();
+        assert!(
+            start.elapsed() >= Duration::from_millis(120),
+            "咬钩后应等待反应延迟再拾取"
+        );
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancel_during_reaction_delay_skips_loot() {
+        let (mut bot, clicks) = humanized_bot(HumanizerConfig {
+            reaction_ms: (5000, 5000),
+            ..HumanizerConfig::disabled()
+        });
+        let cancel = bot.stop_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel.cancel();
+        });
+        let start = Instant::now();
+        bot.wait_for_bite();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "取消应立即中断反应延迟"
+        );
+        assert!(clicks.lock().unwrap().is_empty(), "取消后不应拾取");
+    }
+
+    #[test]
+    fn ten_minute_period_samples_within_jitter_window() {
+        let (mut bot, _) = humanized_bot(HumanizerConfig {
+            ten_min_jitter_secs: 90,
+            ..HumanizerConfig::disabled()
+        });
+        for _ in 0..100 {
+            bot.humanizer.resample_ten_min();
+            let secs = bot.humanizer.ten_min_period().as_secs();
+            assert!(
+                (600..=690).contains(&secs),
+                "周期 {secs}s 超出 600..=690 窗口"
+            );
+        }
     }
 }

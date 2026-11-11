@@ -15,6 +15,8 @@ pub struct Settings {
     pub cast_key: i32,
     pub strike_value: i32,
     pub search_region: Option<Rect>,
+    /// 拟人化节奏开关（扩展功能；见 fishing_core::humanize）
+    pub humanize: bool,
 }
 
 impl Default for Settings {
@@ -23,6 +25,7 @@ impl Default for Settings {
             cast_key: 52,
             strike_value: 7,
             search_region: None,
+            humanize: true,
         }
     }
 }

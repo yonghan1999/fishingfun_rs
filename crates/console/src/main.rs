@@ -40,6 +40,10 @@ struct Args {
     /// 咬钩判定阈值（浮漂下沉像素数）
     #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(i32).range(1..=100))]
     strike_value: i32,
+
+    /// 关闭拟人化节奏（随机反应延迟/抛竿间隔/周期休息/宏键抖动），恢复 C# 原版节拍
+    #[arg(long)]
+    no_humanize: bool,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +82,14 @@ fn main() -> Result<()> {
         }
     });
 
+    let humanizer_cfg = if args.no_humanize {
+        tracing::info!("拟人化节奏已关闭（--no-humanize）");
+        fishing_core::humanize::HumanizerConfig::disabled()
+    } else {
+        tracing::info!("拟人化节奏已开启（--no-humanize 可关闭）");
+        fishing_core::humanize::HumanizerConfig::default()
+    };
+
     let mut bot = FishingBot::new(
         Box::new(bobber_finder),
         Box::new(bite_watcher),
@@ -86,7 +98,8 @@ fn main() -> Result<()> {
         cast_key,
         ten_min_keys,
         tx,
-    );
+    )
+    .with_humanizer(humanizer_cfg);
 
     // C#: WowProcess.PressKey(ConsoleKey.Spacebar); Thread.Sleep(1500);
     let mut keys = WowKeySender::new();

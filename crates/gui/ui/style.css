@@ -107,6 +107,18 @@ html, body {
 }
 .tool-btn .castkey-bg { position: absolute; inset: 0; }
 
+/* 拟人化开关（扩展功能）：与工具按钮同行右对齐 */
+#humanizeLabel {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  height: 50px;
+  cursor: pointer;
+  user-select: none;
+}
+#humanizeToggle { cursor: pointer; }
+
 /* 按键绑定文本框（KeyBindChooser：FontSize 24、透明、居中） */
 #castKeyInput {
   position: relative;

@@ -159,6 +159,12 @@ castKeyInput.addEventListener("keyup", async e => {
 /* 启动时读取持久化的按键（C# ReadConfiguration） */
 invoke("get_cast_key").then(t => { castKeyInput.value = t; });
 
+/* ---------------- 拟人化开关（扩展功能） ---------------- */
+
+const humanizeToggle = el("humanizeToggle");
+invoke("get_humanize").then(v => { humanizeToggle.checked = !!v; });
+humanizeToggle.addEventListener("change", () => invoke("set_humanize", { on: humanizeToggle.checked }));
+
 /* ---------------- 初始化 ---------------- */
 
 window.addEventListener("DOMContentLoaded", () => {

@@ -32,6 +32,8 @@ cargo run -p fishing-console --locked -- --blue --cast-key D4 --ten-min-keys D5,
 
 控制台默认抛竿键为 D4、十分钟宏键为 D5、下沉阈值为 7 像素。GUI 的十分钟宏键固定为 D5、D6。启动机器人会先发送空格；宏键在启动及十分钟周期到期时执行。应先核对游戏内按键绑定。
 
+拟人化节奏默认开启：咬钩后随机延迟 150..450ms 再拾取、每轮抛竿之间停顿 0.8..2.5s、每 25..45 分钟休息 1..4 分钟、十分钟宏键触发窗口加 0..=90s 抖动，拾取时光标沿缓出曲线移动并带 ±3px 落点偏移。控制台用 `--no-humanize` 恢复原版固定节拍；GUI 在主窗口工具栏勾选"拟人化"开关（下次启动机器人生效）。
+
 输入来源工具是独立的 Win32 窗口，显示收到的输入设备类型和来源：
 
 ```powershell
@@ -55,6 +57,7 @@ GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPD
 | `cast_key` | ConsoleKey/Win32 VK 整数 | 52（D4） |
 | `strike_value` | 1..100 下沉阈值整数 | 7 |
 | `search_region` | `{x,y,width,height}`，截图位图坐标 | null（全图搜索） |
+| `humanize` | 拟人化节奏开关（下次启动生效） | true |
 
 首次创建 JSON 时，从当时工作目录的 `keybind.txt`、`strikevalue.txt`、`searchregion.txt` 导入合法值，旧文件保留。已有 JSON 后不再重复导入；JSON 损坏会报告错误，不静默覆盖。保存成功后设置才生效，运行中保存失败会在窗口底部显示。
 

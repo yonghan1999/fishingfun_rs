@@ -7,6 +7,7 @@ pub mod cancellation;
 pub mod classifier;
 pub mod events;
 pub mod fish_bot;
+pub mod humanize;
 pub mod latest;
 pub mod timed_action;
 pub mod tracking_finder;

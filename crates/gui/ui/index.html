@@ -39,6 +39,11 @@
         <img src="assets/Button.png" alt="" class="castkey-bg" />
         <input id="castKeyInput" maxlength="1" value="4" autocomplete="off" />
       </button>
+      <!-- 拟人化节奏开关（扩展功能，持久化到 settings.json，下次启动生效） -->
+      <label id="humanizeLabel" title="模拟人类节奏：随机反应延迟、抛竿停顿、周期休息、宏键抖动">
+        <input type="checkbox" id="humanizeToggle" checked />
+        <span>拟人化</span>
+      </label>
     </div>
 
     <!-- 右下：图表 Flipper + 日志 Flipper -->

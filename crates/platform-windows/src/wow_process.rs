@@ -277,6 +277,46 @@ impl WowMouseController {
         }
     }
 
+    /// 拟人化移动光标（扩展功能）：目标点 ±3px 随机偏移（人点不中精确像素），
+    /// 缓出曲线分步移动（起步快、收尾慢），步间 10..17ms、每步 ±2px 微扰。
+    /// 取消时光标停在中途（像人手离开鼠标），返回 false。
+    fn move_cursor_humanlike(&self, target: Point, cancel: &CancellationToken) -> bool {
+        let mut rng = rand::thread_rng();
+        let jittered = Point::new(
+            target.x + rng.gen_range(-3..=3),
+            target.y + rng.gen_range(-3..=3),
+        );
+        unsafe {
+            let mut from = POINT::default();
+            if GetCursorPos(&mut from).is_err() {
+                return false;
+            }
+            let dx = f64::from(jittered.x - from.x);
+            let dy = f64::from(jittered.y - from.y);
+            let dist = (dx * dx + dy * dy).sqrt();
+            let steps = ((dist / 15.0) as u32).clamp(8, 45);
+            for i in 1..=steps {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                let t = f64::from(i) / f64::from(steps);
+                let ease = 1.0 - (1.0 - t).powi(3);
+                // 终点不叠加微扰，保证落点在 ±3px 目标内
+                let (jx, jy) = if i == steps {
+                    (0, 0)
+                } else {
+                    (rng.gen_range(-2..=2), rng.gen_range(-2..=2))
+                };
+                let _ = SetCursorPos(
+                    from.x + (dx * ease) as i32 + jx,
+                    from.y + (dy * ease) as i32 + jy,
+                );
+                std::thread::sleep(Duration::from_millis(10 + rng.gen_range(0..7)));
+            }
+        }
+        true
+    }
+
     /// C# RefocusOnOldScreen：把焦点交还给之前的窗口并恢复光标。
     /// C# 中 KeyDown(Escape) 发给的是 WoW 进程窗口，保持一致。
     fn refocus(&self, wow_hwnd: HWND, old_cursor: POINT) {
@@ -339,7 +379,12 @@ impl MouseController for WowMouseController {
             if GetCursorPos(&mut old).is_err() {
                 return;
             }
-            let _ = SetCursorPos(position.x, position.y);
+            // 拟人化：替换 C# 的瞬时 SetCursorPos 瞬移（行为检测的典型特征）。
+            // 取消/失败时光标回原位，不再继续点击。
+            if !self.move_cursor_humanlike(position, cancel) {
+                let _ = SetCursorPos(old.x, old.y);
+                return;
+            }
             if !cancel.wait(Duration::from_millis(loot_delay)) {
                 let _ = SetCursorPos(old.x, old.y);
                 return;

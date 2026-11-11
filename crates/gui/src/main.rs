@@ -17,6 +17,7 @@ use fishing_core::bobber_finder::{highlight_colour, FrameEvent};
 use fishing_core::classifier::{ClassifierMode, PixelClassifier};
 use fishing_core::events::FishingEvent;
 use fishing_core::fish_bot::FishingBot;
+use fishing_core::humanize::HumanizerConfig;
 use fishing_core::tracking_finder::TrackingBobberFinder;
 use fishing_core::traits::{Key, KeySender};
 use fishing_core::{Point, Rect};
@@ -189,6 +190,7 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let config = state.config.get();
     let key = Key::from_console_key_value(config.cast_key).ok_or("抛竿键无效")?;
     let session = state.bot.reserve(key, config.strike_value)?;
+    let config_humanize = config.humanize;
     let classifier = state.classifier.clone();
     let search_region = state.search_region.clone();
     let app2 = app.clone();
@@ -247,6 +249,11 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                     WowScreenCapture::new(),
                 );
                 finder.set_frame_handler(frame_tx);
+                let humanize_cfg = if config_humanize {
+                    HumanizerConfig::default()
+                } else {
+                    HumanizerConfig::disabled()
+                };
                 let mut bot = FishingBot::new(
                     Box::new(finder),
                     Box::new(PositionBiteWatcher::new(session.strike)),
@@ -256,7 +263,8 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                     vec![Key::D5, Key::D6],
                     ev_tx,
                 )
-                .with_session(session.cancel.clone(), session.cast_key.clone());
+                .with_session(session.cancel.clone(), session.cast_key.clone())
+                .with_humanizer(humanize_cfg);
                 bot.start();
                 session.cancel.cancel();
                 drop(bot);
@@ -382,6 +390,19 @@ fn set_loot_delay(ms: u64) -> Result<(), String> {
 #[tauri::command]
 fn get_strike_value(state: State<AppState>) -> i32 {
     state.config.get().strike_value
+}
+
+/// 拟人化节奏开关（扩展功能，下次启动机器人生效）。
+#[tauri::command]
+fn get_humanize(state: State<AppState>) -> bool {
+    state.config.get().humanize
+}
+
+#[tauri::command]
+fn set_humanize(on: bool, state: State<AppState>) -> Result<(), String> {
+    state.config.update(|c| c.humanize = on)?;
+    tracing::info!("拟人化节奏: {}", if on { "开启" } else { "关闭" });
+    Ok(())
 }
 
 #[tauri::command]
@@ -529,6 +550,8 @@ fn main() {
             set_loot_delay,
             get_strike_value,
             set_strike_value,
+            get_humanize,
+            set_humanize,
             capture_screen,
             open_colour_window,
             get_search_region,
