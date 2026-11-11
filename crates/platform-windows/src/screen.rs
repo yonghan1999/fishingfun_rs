@@ -9,12 +9,49 @@ use image::RgbImage;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
-    SRCCOPY,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
 };
+
+// 作用域守卫覆盖所有提前返回路径。
+struct ScreenDc(HDC);
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseDC(HWND::default(), self.0);
+        }
+    }
+}
+struct MemoryDc(HDC);
+impl Drop for MemoryDc {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.0);
+        }
+    }
+}
+struct Bitmap(HBITMAP);
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.0 .0));
+        }
+    }
+}
+struct SelectedBitmap {
+    dc: HDC,
+    old: HGDIOBJ,
+}
+impl Drop for SelectedBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+        }
+    }
+}
 
 /// 主屏尺寸（对应 Screen.PrimaryScreen.Bounds）。
 fn primary_screen_size() -> (i32, i32) {
@@ -24,7 +61,7 @@ fn primary_screen_size() -> (i32, i32) {
 /// 对应 C# WowScreen 的静态截屏逻辑。
 ///
 /// 注意 DPI：与 WinForms 版一致，进程需声明 system DPI aware，
-/// 否则 GetSystemMetrics 返回缩放后的逻辑像素（见 docs/06-risks.md R2，
+/// 否则 GetSystemMetrics 返回缩放后的逻辑像素（见仓库 docs/development.md，
 /// manifest 在 console/gui 打包时配置）。
 #[derive(Debug, Default)]
 pub struct WowScreenCapture;
@@ -35,7 +72,7 @@ impl WowScreenCapture {
     }
 
     /// 截取主屏中央区域，返回 (宽 W/2, 高 H/2−100)，原点 (W/4, H/4)。
-    fn capture_impl() -> anyhow::Result<CapturedFrame> {
+    pub fn try_capture() -> anyhow::Result<CapturedFrame> {
         let (sw, sh) = primary_screen_size();
         let width = sw / 2;
         let height = sh / 2 - 100;
@@ -44,13 +81,10 @@ impl WowScreenCapture {
         anyhow::ensure!(width > 0 && height > 0, "屏幕尺寸异常: {sw}x{sh}");
 
         unsafe {
-            let screen_dc = GetDC(HWND::default());
-            anyhow::ensure!(!screen_dc.is_invalid(), "GetDC 失败");
+            let screen_dc = ScreenDc(GetDC(HWND::default()));
+            anyhow::ensure!(!screen_dc.0.is_invalid(), "GetDC 失败");
 
-            let result = capture_region(screen_dc, origin.x, origin.y, width, height);
-            ReleaseDC(HWND::default(), screen_dc);
-
-            let pixels = result?;
+            let pixels = capture_region(screen_dc.0, origin.x, origin.y, width, height)?;
             Ok(CapturedFrame {
                 image: pixels,
                 origin,
@@ -68,14 +102,18 @@ unsafe fn capture_region(
     height: i32,
 ) -> anyhow::Result<RgbImage> {
     unsafe {
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        anyhow::ensure!(!mem_dc.is_invalid(), "CreateCompatibleDC 失败");
+        let mem_dc = MemoryDc(CreateCompatibleDC(screen_dc));
+        anyhow::ensure!(!mem_dc.0.is_invalid(), "CreateCompatibleDC 失败");
 
-        let bmp = CreateCompatibleBitmap(screen_dc, width, height);
-        anyhow::ensure!(!bmp.is_invalid(), "CreateCompatibleBitmap 失败");
+        let bmp = Bitmap(CreateCompatibleBitmap(screen_dc, width, height));
+        anyhow::ensure!(!bmp.0.is_invalid(), "CreateCompatibleBitmap 失败");
 
-        let old = SelectObject(mem_dc, HGDIOBJ(bmp.0));
-        BitBlt(mem_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY)?;
+        let old = SelectObject(mem_dc.0, HGDIOBJ(bmp.0 .0));
+        anyhow::ensure!(!old.is_invalid(), "SelectObject 失败");
+        let selected = SelectedBitmap { dc: mem_dc.0, old };
+        BitBlt(mem_dc.0, 0, 0, width, height, screen_dc, x, y, SRCCOPY)?;
+        // GetDIBits 要求位图不再选入 DC。
+        drop(selected);
 
         // 32bpp 自顶向下 DIB
         let mut bmi = BITMAPINFO {
@@ -92,9 +130,9 @@ unsafe fn capture_region(
         };
 
         let mut buf = vec![0u8; (width * height * 4) as usize];
-        GetDIBits(
-            mem_dc,
-            bmp,
+        let copied = GetDIBits(
+            mem_dc.0,
+            bmp.0,
             0,
             height as u32,
             Some(buf.as_mut_ptr() as *mut _),
@@ -102,9 +140,7 @@ unsafe fn capture_region(
             DIB_RGB_COLORS,
         );
 
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem_dc);
+        anyhow::ensure!(copied == height, "GetDIBits 读取不完整: {copied}/{height}");
 
         // BGRA → RGB
         let mut img = RgbImage::new(width as u32, height as u32);
@@ -118,12 +154,19 @@ unsafe fn capture_region(
 
 impl ScreenCapture for WowScreenCapture {
     fn capture(&mut self) -> CapturedFrame {
-        match Self::capture_impl() {
+        match Self::try_capture() {
             Ok(frame) => frame,
             Err(e) => {
                 // C# 版截屏异常会在 bot 主循环被 catch；Rust 版此处容错返回 1x1 空帧
                 // （等价于 C# 中"找不到浮漂"路径），避免中断主循环。
-                tracing::error!("截屏失败: {e:#}");
+                static LAST_ERROR: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                if let Ok(mut last) = LAST_ERROR.lock() {
+                    if last.is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(5)) {
+                        tracing::error!("截屏失败: {e:#}");
+                        *last = Some(std::time::Instant::now());
+                    }
+                }
                 CapturedFrame {
                     image: RgbImage::new(1, 1),
                     origin: Point::EMPTY,
@@ -146,7 +189,28 @@ pub(crate) fn window_rect(hwnd: HWND) -> Option<RECT> {
 
 #[cfg(test)]
 mod tests {
-    /// 冒烟测试需真实桌面环境，默认 ignore（docs/05-testing-strategy.md 第 3 层）。
+    #[test]
+    #[ignore = "需要真实 Windows 桌面会话；覆盖成功和 BitBlt 错误路径的 GDI 回收"]
+    fn capture_releases_gdi_on_success_and_failure() {
+        use super::*;
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS,
+        };
+        unsafe {
+            let dc = ScreenDc(GetDC(HWND::default()));
+            assert!(!dc.0.is_invalid());
+            capture_region(dc.0, 0, 0, 10, 10).unwrap();
+            let frame = WowScreenCapture::try_capture().unwrap();
+            assert!(frame.image.width() > 1 && frame.image.height() > 1);
+            let before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            for _ in 0..50 {
+                capture_region(dc.0, 0, 0, 10, 10).unwrap();
+                assert!(capture_region(HDC::default(), 0, 0, 10, 10).is_err());
+            }
+            assert_eq!(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), before);
+        }
+    }
+    /// 冒烟测试需真实桌面环境，默认 ignore（见仓库 docs/development.md）。
     /// 运行: cargo test -p fishing-platform-windows -- --ignored
     #[test]
     #[ignore = "需要真实 Windows 桌面会话"]
