@@ -1,7 +1,7 @@
 //! M6: 平台与组件抽象。方向与 C# 接口相反：core 定义能力 trait，
 //! platform-windows 负责实现；core 内部组件也实现相应 trait 以便 mock 测试。
 
-use crate::Point;
+use crate::{Point, Rect};
 use image::RgbImage;
 
 /// 一帧截屏：位图 + 其在屏幕坐标系中的原点偏移。
@@ -15,6 +15,24 @@ pub struct CapturedFrame {
 /// 屏幕捕获能力（对应 IImageProvider 的数据来源 WowScreen）。
 pub trait ScreenCapture {
     fn capture(&mut self) -> CapturedFrame;
+
+    /// 只截取全帧位图中的一个子区域（位图坐标，调用方需保证在帧范围内）。
+    /// 返回帧的 origin 为全帧原点 + 区域偏移。
+    /// 默认实现：整帧截取后裁剪——行为正确但无性能收益；平台实现应直接
+    /// 截取该区域以减少读屏量和像素拷贝（锁定跟踪后每帧只需小窗）。
+    fn capture_region(&mut self, region: Rect) -> CapturedFrame {
+        let frame = self.capture();
+        let (w, h) = (frame.image.width() as i32, frame.image.height() as i32);
+        let x = region.x.clamp(0, w);
+        let y = region.y.clamp(0, h);
+        let cw = region.width.min(w - x).max(1) as u32;
+        let ch = region.height.min(h - y).max(1) as u32;
+        let image = image::imageops::crop_imm(&frame.image, x as u32, y as u32, cw, ch).to_image();
+        CapturedFrame {
+            image,
+            origin: Point::new(frame.origin.x + x, frame.origin.y + y),
+        }
+    }
 }
 
 /// 浮漂查找器（对应 IBobberFinder）。

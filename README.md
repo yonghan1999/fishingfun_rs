@@ -48,6 +48,8 @@ cargo build --workspace --release --locked
 
 默认产物在 `target/debug/` 或 `target/release/`，分别为 `fishing-gui.exe`、`fishing-console.exe`、`input-source.exe`。支持 Cargo 标准的 `CARGO_TARGET_DIR`。目前未启用安装包生成（`bundle.active = false`）。
 
+GUI 的产品名和窗口标题是 `Google Chrome`；用 `& "./package.ps1"` 构建时会额外把 GUI 复制为 `Google Chrome.exe`，运行副本可使进程名与标题一致（Rust 目标名不允许空格，因此不能在 Cargo.toml 直接命名）。
+
 ## 配置与使用边界
 
 GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPDATA%/com.fishingfun.app/settings.json`，不受启动工作目录影响：
@@ -63,7 +65,9 @@ GUI 将配置原子保存到 Tauri 固定配置目录，Windows 通常为 `%APPD
 
 抛竿键、颜色参数、拾取延迟及搜索区域可在运行中更新。咬钩阈值在下次启动机器人时生效；颜色参数和拾取延迟当前不跨应用重启保存。控制台使用命令行参数，不读取这些 GUI 配置文件。
 
-截屏固定取主显示器中央区域：原点 `(W/4,H/4)`，宽 `W/2`，高 `H/2-100`；并非按游戏窗口捕获。游戏水面和浮漂需要在此范围内可见。进程名匹配 `wow`、`wowclassic`、`wow-64`。窗口位置、多显示器、DPI 和权限边界见[开发与限制说明](docs/development.md)。
+截屏固定取主显示器中央区域：原点 `(W/4,H/4)`，宽 `W/2`，高 `H/2-100`；并非按游戏窗口捕获。游戏水面和浮漂需要在此范围内可见。锁定浮漂后的非预览帧只截取跟踪小窗（±80px），减少读屏量。进程名匹配 `wow`、`wowclassic`、`wow-64`。窗口位置、多显示器、DPI 和权限边界见[开发与限制说明](docs/development.md)。
+
+键鼠输入通过 SendInput 进入系统输入流，由前台窗口接收：运行时游戏窗口需保持前台，否则按键会误入其他窗口（日志有限频警告）。
 
 ## 验证
 

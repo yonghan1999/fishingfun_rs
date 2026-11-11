@@ -4,7 +4,7 @@
 //! C# Graphics.CopyFromScreen 底层即 GDI BitBlt，此处直接调用等价 API。
 
 use fishing_core::traits::{CapturedFrame, ScreenCapture};
-use fishing_core::Point;
+use fishing_core::{Point, Rect};
 use image::RgbImage;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -91,6 +91,54 @@ impl WowScreenCapture {
             })
         }
     }
+
+    /// 只截取全帧位图中的一个子区域（位图坐标，见 ScreenCapture::capture_region）。
+    /// 锁定跟踪后每帧只需 ±track_radius 小窗，读屏量和像素处理下降两个数量级。
+    pub fn try_capture_region(region: Rect) -> anyhow::Result<CapturedFrame> {
+        let (sw, sh) = primary_screen_size();
+        let base = Point::new(sw / 4, sh / 4);
+        let (max_w, max_h) = (sw / 2, sh / 2 - 100);
+
+        // 裁剪到全帧范围（位图坐标）
+        let x0 = region.x.clamp(0, max_w);
+        let y0 = region.y.clamp(0, max_h);
+        let x1 = (region.x as i64 + region.width as i64).clamp(0, max_w as i64) as i32;
+        let y1 = (region.y as i64 + region.height as i64).clamp(0, max_h as i64) as i32;
+        anyhow::ensure!(x1 > x0 && y1 > y0, "子区域为空: {region:?}");
+
+        unsafe {
+            let screen_dc = ScreenDc(GetDC(HWND::default()));
+            anyhow::ensure!(!screen_dc.0.is_invalid(), "GetDC 失败");
+
+            let pixels = capture_region(screen_dc.0, base.x + x0, base.y + y0, x1 - x0, y1 - y0)?;
+            Ok(CapturedFrame {
+                image: pixels,
+                origin: Point::new(base.x + x0, base.y + y0),
+            })
+        }
+    }
+
+    /// 失败时容错返回 1x1 空帧（等价于 C# 中"找不到浮漂"路径），避免中断主循环。
+    /// 错误日志限频 5s，避免刷屏。
+    fn capture_or_fallback(result: anyhow::Result<CapturedFrame>) -> CapturedFrame {
+        match result {
+            Ok(frame) => frame,
+            Err(e) => {
+                static LAST_ERROR: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                if let Ok(mut last) = LAST_ERROR.lock() {
+                    if last.is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(5)) {
+                        tracing::error!("截屏失败: {e:#}");
+                        *last = Some(std::time::Instant::now());
+                    }
+                }
+                CapturedFrame {
+                    image: RgbImage::new(1, 1),
+                    origin: Point::EMPTY,
+                }
+            }
+        }
+    }
 }
 
 /// BitBlt + GetDIBits：从 screen_dc 的 (x, y) 起取 width×height，转 RgbImage。
@@ -154,25 +202,11 @@ unsafe fn capture_region(
 
 impl ScreenCapture for WowScreenCapture {
     fn capture(&mut self) -> CapturedFrame {
-        match Self::try_capture() {
-            Ok(frame) => frame,
-            Err(e) => {
-                // C# 版截屏异常会在 bot 主循环被 catch；Rust 版此处容错返回 1x1 空帧
-                // （等价于 C# 中"找不到浮漂"路径），避免中断主循环。
-                static LAST_ERROR: std::sync::Mutex<Option<std::time::Instant>> =
-                    std::sync::Mutex::new(None);
-                if let Ok(mut last) = LAST_ERROR.lock() {
-                    if last.is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(5)) {
-                        tracing::error!("截屏失败: {e:#}");
-                        *last = Some(std::time::Instant::now());
-                    }
-                }
-                CapturedFrame {
-                    image: RgbImage::new(1, 1),
-                    origin: Point::EMPTY,
-                }
-            }
-        }
+        Self::capture_or_fallback(Self::try_capture())
+    }
+
+    fn capture_region(&mut self, region: Rect) -> CapturedFrame {
+        Self::capture_or_fallback(Self::try_capture_region(region))
     }
 }
 

@@ -125,6 +125,16 @@ impl Humanizer {
         Duration::from_secs(10 * 60 + jitter)
     }
 
+    /// 识别轮询间隔：拟人化开启时 8..=25ms 随机抖动（固定 10ms 节拍是机器特征），
+    /// 关闭时固定 10ms（C# 保真）。
+    pub fn poll_interval(&mut self) -> Duration {
+        if self.cfg == HumanizerConfig::disabled() {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(self.rng.gen_range(8..=25))
+        }
+    }
+
     /// 当前十分钟宏键周期（含抖动）。
     pub fn ten_min_period(&self) -> Duration {
         self.ten_min_period
@@ -244,5 +254,21 @@ mod tests {
         });
         assert_eq!(h.next_break_at, None);
         assert_eq!(h.break_due(), None);
+    }
+
+    #[test]
+    fn poll_interval_is_fixed_when_disabled_and_jittered_when_enabled() {
+        let mut h = Humanizer::disabled();
+        for _ in 0..10 {
+            assert_eq!(h.poll_interval(), Duration::from_millis(10));
+        }
+        let mut h = seeded(HumanizerConfig::default());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let ms = h.poll_interval().as_millis() as u64;
+            assert!((8..=25).contains(&ms), "轮询间隔 {ms}ms 超出 8..=25");
+            seen.insert(ms);
+        }
+        assert!(seen.len() > 5, "轮询间隔缺少抖动: {:?}", seen);
     }
 }

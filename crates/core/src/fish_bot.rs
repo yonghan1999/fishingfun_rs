@@ -174,7 +174,8 @@ impl FishingBot {
         let start = Instant::now();
         while self.is_enabled() && start.elapsed().as_millis() < milliseconds as u128 {
             self.bobber_finder.find();
-            self.cancel.wait(Duration::from_millis(10));
+            let interval = self.humanizer.poll_interval();
+            self.cancel.wait(interval);
         }
     }
 
@@ -222,7 +223,8 @@ impl FishingBot {
                 return;
             }
 
-            self.cancel.wait(Duration::from_millis(10));
+            let interval = self.humanizer.poll_interval();
+            self.cancel.wait(interval);
         }
     }
 
@@ -293,7 +295,8 @@ impl FishingBot {
             if target.is_some() || !timer.execute_if_due() {
                 return self.is_enabled().then_some(target).flatten();
             }
-            self.cancel.wait(Duration::from_millis(10));
+            let interval = self.humanizer.poll_interval();
+            self.cancel.wait(interval);
         }
         None
     }

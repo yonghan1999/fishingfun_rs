@@ -76,6 +76,8 @@ pub struct TrackingBobberFinder<C: ScreenCapture> {
     state: State,
     /// Locked 状态下最后一次命中的墙钟时刻（丢失容忽略）
     last_seen: Option<Instant>,
+    /// 最近一次全帧截屏的尺寸（小窗截屏时用于计算位图坐标边界）
+    last_full_size: Option<(i32, i32)>,
     frame_handler: Option<LatestSender<FrameEvent>>,
     raw: Vec<bool>,
     integral: Vec<u32>,
@@ -95,6 +97,7 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
             capture,
             state: State::Searching,
             last_seen: None,
+            last_full_size: None,
             frame_handler: None,
             raw: Vec::new(),
             integral: Vec::new(),
@@ -121,6 +124,7 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
             capture,
             state: State::Searching,
             last_seen: None,
+            last_full_size: None,
             frame_handler: None,
             raw: Vec::new(),
             integral: Vec::new(),
@@ -251,6 +255,53 @@ impl<C: ScreenCapture> TrackingBobberFinder<C> {
         self.region.map_or(full, |region| clip(region, full))
     }
 
+    /// 锁定/确认期间的小窗截屏区域（位图坐标）；预览帧或全局搜索阶段返回 None。
+    /// 预览帧仍取全图：UI 需要完整水面画面。
+    fn window_capture_bounds(&self, preview: bool) -> Option<Rect> {
+        if preview {
+            return None;
+        }
+        let center = match self.state {
+            State::Searching => return None,
+            State::Confirming { candidate, .. } => candidate,
+            State::Locked { pos } => pos,
+        };
+        let (w, h) = self.last_full_size?;
+        let full = Rect::new(0, 0, w, h);
+        let global = self.region.map_or(full, |region| clip(region, full));
+        let r = self.cfg.track_radius;
+        Some(clip(
+            Rect::new(
+                center.x.saturating_sub(r),
+                center.y.saturating_sub(r),
+                r.saturating_mul(2).saturating_add(1),
+                r.saturating_mul(2).saturating_add(1),
+            ),
+            global,
+        ))
+    }
+
+    /// 记录最近一次全帧尺寸；1x1 是截屏失败的容错帧，不能当作真实尺寸。
+    fn remember_full_size(&mut self, frame: &CapturedFrame) {
+        if frame.image.width() > 1 && frame.image.height() > 1 {
+            self.last_full_size = Some((frame.image.width() as i32, frame.image.height() as i32));
+        }
+    }
+
+    /// 全局重搜：小窗截屏帧不足以重搜，需补一帧全图。
+    fn research_global(
+        &mut self,
+        frame: &mut CapturedFrame,
+        was_window_capture: bool,
+        preview: bool,
+    ) -> (Vec<Point>, Vec<bool>) {
+        if was_window_capture {
+            *frame = self.capture.capture();
+            self.remember_full_size(frame);
+        }
+        self.find_match_points(&frame.image, self.global_bounds(&frame.image), preview)
+    }
+
     fn active_bounds(&self, image: &RgbImage) -> Rect {
         let global = self.global_bounds(image);
         let center = match self.state {
@@ -329,13 +380,39 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
 
     fn find(&mut self) -> Option<Point> {
         self.refresh_shared();
-        let frame = self.capture.capture();
         let preview = self.frame_handler.is_some()
             && self
                 .last_preview
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(66));
-        let bounds = self.active_bounds(&frame.image);
+
+        // 锁定/确认期间的非预览帧只截小窗：读屏量和像素处理下降两个数量级。
+        // 小窗帧的图像坐标需换算回全帧位图坐标（状态机全程使用位图坐标）。
+        let win = self.window_capture_bounds(preview);
+        let (mut frame, offset) = match win {
+            Some(r) => (self.capture.capture_region(r), Point::new(r.x, r.y)),
+            None => {
+                let f = self.capture.capture();
+                self.remember_full_size(&f);
+                (f, Point::EMPTY)
+            }
+        };
+        let bounds = if win.is_some() {
+            Rect::new(
+                0,
+                0,
+                frame.image.width() as i32,
+                frame.image.height() as i32,
+            )
+        } else {
+            self.active_bounds(&frame.image)
+        };
         let (mut points, mut mask) = self.find_match_points(&frame.image, bounds, preview);
+        if offset != Point::EMPTY {
+            for p in &mut points {
+                p.x += offset.x;
+                p.y += offset.y;
+            }
+        }
 
         let now = Instant::now();
         let result: Option<Point> = match self.state {
@@ -359,11 +436,8 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                             Some(pos)
                         } else {
                             self.points = points;
-                            (points, mask) = self.find_match_points(
-                                &frame.image,
-                                self.global_bounds(&frame.image),
-                                preview,
-                            );
+                            (points, mask) =
+                                self.research_global(&mut frame, win.is_some(), preview);
                             self.search_global(&points)
                         }
                     }
@@ -389,11 +463,7 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                     }
                     None => {
                         self.points = points;
-                        (points, mask) = self.find_match_points(
-                            &frame.image,
-                            self.global_bounds(&frame.image),
-                            preview,
-                        );
+                        (points, mask) = self.research_global(&mut frame, win.is_some(), preview);
                         self.search_global(&points)
                     }
                 }
@@ -643,11 +713,13 @@ mod tests {
 
     #[test]
     fn lost_beyond_tolerance_researches_globally() {
-        // lost_tolerance=0：锁定后丢失立即全局重搜；无红 → None 回 Searching
+        // lost_tolerance=0：锁定后丢失立即全局重搜；无红 → None 回 Searching。
+        // 小窗截帧丢失后需补一帧全图重搜，故准备 4 帧。
         let frames = vec![
             red_block_image(200, 200, 50, 60, 10),
             red_block_image(200, 200, 50, 60, 10),
             RgbImage::new(200, 200),
+            RgbImage::new(200, 200), // 全局重搜补帧
         ];
         let cfg = TrackingConfig {
             lost_tolerance: Duration::ZERO,
@@ -721,5 +793,65 @@ mod tests {
         assert!(ev.mask[(64 * width + 55) as usize]);
         // 笔画像素被密度过滤剔除
         assert!(!ev.mask[(30 * width + 130) as usize]);
+    }
+
+    /// 记录每次捕获请求（None = 全帧，Some = 子区域），模拟平台子区域截屏。
+    struct SpyCapture {
+        image: RgbImage,
+        requests: Vec<Option<Rect>>,
+    }
+
+    impl ScreenCapture for SpyCapture {
+        fn capture(&mut self) -> CapturedFrame {
+            self.requests.push(None);
+            CapturedFrame {
+                image: self.image.clone(),
+                origin: ORIGIN,
+            }
+        }
+
+        fn capture_region(&mut self, region: Rect) -> CapturedFrame {
+            self.requests.push(Some(region));
+            let img = image::imageops::crop_imm(
+                &self.image,
+                region.x as u32,
+                region.y as u32,
+                region.width as u32,
+                region.height as u32,
+            )
+            .to_image();
+            CapturedFrame {
+                image: img,
+                origin: Point::new(ORIGIN.x + region.x, ORIGIN.y + region.y),
+            }
+        }
+    }
+
+    #[test]
+    fn locked_tracking_uses_window_capture_and_still_follows() {
+        let mut img = RgbImage::new(200, 200);
+        paint_block(&mut img, 50, 60, 10, 10, [255, 0, 0]);
+        let mut f = TrackingBobberFinder::new(
+            PixelClassifier::new(),
+            SpyCapture {
+                image: img,
+                requests: vec![],
+            },
+        );
+        assert_eq!(f.find(), None, "首帧确认中");
+        let locked = f.find().expect("第 2 帧应锁定");
+        let followed = f.find().expect("锁定后小窗截屏仍应跟踪");
+        assert_eq!(followed, locked);
+
+        let requests = &f.capture.requests;
+        assert_eq!(requests[0], None, "全局搜索必须是全帧截屏");
+        for (i, r) in requests.iter().enumerate().skip(1) {
+            let r = r.unwrap_or_else(|| panic!("第 {i} 次锁定帧应使用小窗截屏"));
+            assert!(r.width <= 161 && r.height <= 161, "小窗不应超过 ±80: {r:?}");
+            assert!(
+                r.contains(Point::new(locked.x - ORIGIN.x, locked.y - ORIGIN.y)),
+                "小窗必须包含锁定点: {r:?}"
+            );
+        }
     }
 }

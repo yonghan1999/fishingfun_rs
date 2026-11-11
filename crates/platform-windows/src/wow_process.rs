@@ -2,10 +2,15 @@
 //! 保真要点：
 //! - 进程名匹配：Wow / WowClassic / Wow-64，小写比较（C# ProcessName 无扩展名，
 //!   Toolhelp32 的 szExeFile 带 .exe，需先剥掉）；
-//! - 按键：PostMessage(WM_KEYDOWN/UP, vk, 0)，按下保持 50 + [0,75)ms；
-//! - 拾取用 LiamCooper 流程：RightUp → 移动 → 等 LootDelay → RightDown/Up →
+//! - 按键：保持 50 + [0,75)ms 后抬起（与 C# 一致）；
+//! - 拾取用 LiamCooper 流程：RightUp → 拟人化移动 → 等 LootDelay → RightDown/Up →
 //!   恢复原窗口焦点与光标；
 //! - 找不到 WoW 进程时记日志并跳过（C# 返回 null 后同样跳过，不抛异常）。
+//!
+//! 有意偏离 C#：输入注入从 PostMessage/ mouse_event 迁移到 SendInput。
+//! PostMessage 绕过系统输入队列（无扫描码、无队列上下文，是行为检测的典型特征）；
+//! SendInput 进入 win32k 输入流，与真实输入走同一路径。代价是按键由前台窗口
+//! 接收：WoW 不在前台时会记警告日志（拾取的光标移动本来就要求游戏可见）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,11 +24,15 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    mouse_event, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, PostMessageW, SetCursorPos, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SetCursorPos, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
@@ -176,9 +185,109 @@ impl WowKeySender {
     }
 }
 
+/// SendInput 注入一次按键：虚拟键码 + 扫描码（MapVirtualKeyW 取得），
+/// 扩展键补 KEYEVENTF_EXTENDEDKEY。返回 false 表示被 UIPI 等拦截。
+fn send_key(key: Key, key_up: bool) -> bool {
+    let vk = key.vk_code();
+    let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) };
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    // 方向键、Home/End、Win/Apps 等扩展键必须带 EXTENDEDKEY，否则目标程序
+    // 可能识别成不同的键
+    if matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0x6F | 0x90
+    ) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                wScan: scan as u16,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        tracing::error!("SendInput 按键 {:?} 被系统拦截（UIPI 权限隔离?）", key);
+        return false;
+    }
+    true
+}
+
+/// 注入一次鼠标事件。绝对移动时 dx/dy 需归一化到虚拟桌面 0..=65535。
+fn send_mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> bool {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        tracing::error!("SendInput 鼠标事件被系统拦截");
+        return false;
+    }
+    true
+}
+
+/// 把光标移动到屏幕坐标 (x, y)：走输入流的绝对移动（低级钩子可见、
+/// 产生正常 WM_MOUSEMOVE），比 SetCursorPos 更接近真实鼠标。
+fn send_mouse_move(x: i32, y: i32) {
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let norm = |v: i32, origin: i32, size: i32| -> i32 {
+        (i64::from(v - origin) * 65535 / i64::from((size - 1).max(1))).clamp(0, 65535) as i32
+    };
+    send_mouse_input(
+        norm(x, vx, vw),
+        norm(y, vy, vh),
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    );
+}
+
+/// SendInput 的按键由前台窗口接收；WoW 不在前台时按键会误入其他窗口，
+/// 限频警告（30s），避免日志刷屏。
+fn warn_if_wow_not_foreground() {
+    let ok = find_wow_process(None)
+        .and_then(|wow| active_window().map(|active| active.0 == wow.main_window.0))
+        .unwrap_or(false);
+    if ok {
+        return;
+    }
+    static LAST_WARN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if let Ok(mut last) = LAST_WARN.lock() {
+        if last.is_none_or(|time| time.elapsed() >= Duration::from_secs(30)) {
+            tracing::warn!("WoW 窗口不在前台：SendInput 按键将发送给当前前台窗口");
+            *last = Some(std::time::Instant::now());
+        }
+    }
+}
+
 impl KeySender for WowKeySender {
     /// C#: KeyDown → sleep(50 + Next(0,75)) → KeyUp
     fn press_key(&mut self, key: Key) {
+        warn_if_wow_not_foreground();
         self.key_down(key);
         std::thread::sleep(Duration::from_millis(
             50 + rand::thread_rng().gen_range(0..75),
@@ -188,29 +297,11 @@ impl KeySender for WowKeySender {
 
     fn key_down(&mut self, key: Key) {
         self.last_key = Some(key);
-        if let Some(wow) = find_wow_process(None) {
-            unsafe {
-                let _ = PostMessageW(
-                    wow.main_window,
-                    WM_KEYDOWN,
-                    WPARAM(key.vk_code() as usize),
-                    LPARAM(0),
-                );
-            }
-        }
+        send_key(key, false);
     }
 
     fn key_up(&mut self, key: Key) {
-        if let Some(wow) = find_wow_process(None) {
-            unsafe {
-                let _ = PostMessageW(
-                    wow.main_window,
-                    WM_KEYUP,
-                    WPARAM(key.vk_code() as usize),
-                    LPARAM(0),
-                );
-            }
-        }
+        send_key(key, true);
     }
 }
 
@@ -307,7 +398,7 @@ impl WowMouseController {
                 } else {
                     (rng.gen_range(-2..=2), rng.gen_range(-2..=2))
                 };
-                let _ = SetCursorPos(
+                send_mouse_move(
                     from.x + (dx * ease) as i32 + jx,
                     from.y + (dy * ease) as i32 + jy,
                 );
@@ -370,7 +461,8 @@ impl MouseController for WowMouseController {
         let loot_delay = LOOT_DELAY_MS.load(Ordering::SeqCst);
 
         unsafe {
-            mouse_event(MOUSEEVENTF_RIGHTUP, position.x, position.y, 0, 0);
+            // 初始 RightUp 在原光标位置（C# mouse_event 无 MOVE 标志时坐标被忽略）
+            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP);
             let mut old = POINT::default();
 
             if !cancel.wait(Duration::from_millis(200)) {
@@ -382,22 +474,22 @@ impl MouseController for WowMouseController {
             // 拟人化：替换 C# 的瞬时 SetCursorPos 瞬移（行为检测的典型特征）。
             // 取消/失败时光标回原位，不再继续点击。
             if !self.move_cursor_humanlike(position, cancel) {
-                let _ = SetCursorPos(old.x, old.y);
+                send_mouse_move(old.x, old.y);
                 return;
             }
             if !cancel.wait(Duration::from_millis(loot_delay)) {
-                let _ = SetCursorPos(old.x, old.y);
+                send_mouse_move(old.x, old.y);
                 return;
             }
-            mouse_event(MOUSEEVENTF_RIGHTDOWN, position.x, position.y, 0, 0);
+            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTDOWN);
             std::thread::sleep(Duration::from_millis(
                 30 + rand::thread_rng().gen_range(0..47),
             ));
-            mouse_event(MOUSEEVENTF_RIGHTUP, position.x, position.y, 0, 0);
+            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP);
 
             // 按下后必须成对释放；取消后只恢复光标，不再发送焦点/按键消息。
             if cancel.is_cancelled() {
-                let _ = SetCursorPos(old.x, old.y);
+                send_mouse_move(old.x, old.y);
                 return;
             }
             self.refocus(wow.main_window, old);
