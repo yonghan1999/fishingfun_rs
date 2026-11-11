@@ -388,7 +388,7 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
         // 锁定/确认期间的非预览帧只截小窗：读屏量和像素处理下降两个数量级。
         // 小窗帧的图像坐标需换算回全帧位图坐标（状态机全程使用位图坐标）。
         let win = self.window_capture_bounds(preview);
-        let (mut frame, offset) = match win {
+        let (mut frame, mut offset) = match win {
             Some(r) => (self.capture.capture_region(r), Point::new(r.x, r.y)),
             None => {
                 let f = self.capture.capture();
@@ -396,6 +396,12 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                 (f, Point::EMPTY)
             }
         };
+        // 平台返回的 1x1 容错帧不是一次有效观测，不能用其原点返回旧锁定位置。
+        if frame.image.width() <= 1 || frame.image.height() <= 1 {
+            self.state = State::Searching;
+            self.last_seen = None;
+            return None;
+        }
         let bounds = if win.is_some() {
             Rect::new(
                 0,
@@ -438,6 +444,7 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                             self.points = points;
                             (points, mask) =
                                 self.research_global(&mut frame, win.is_some(), preview);
+                            offset = Point::EMPTY;
                             self.search_global(&points)
                         }
                     }
@@ -464,6 +471,7 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
                     None => {
                         self.points = points;
                         (points, mask) = self.research_global(&mut frame, win.is_some(), preview);
+                        offset = Point::EMPTY;
                         self.search_global(&points)
                     }
                 }
@@ -487,7 +495,10 @@ impl<C: ScreenCapture> BobberFinder for TrackingBobberFinder<C> {
         }
 
         // 位图坐标 → 屏幕坐标
-        result.map(|p| Point::new(p.x + frame.origin.x, p.y + frame.origin.y))
+        // 状态机结果已是全帧位图坐标；小窗 frame.origin 还包含区域偏移，需扣除。
+        // 全局重搜补帧后 origin 已恢复全帧原点。
+        let origin = Point::new(frame.origin.x - offset.x, frame.origin.y - offset.y);
+        result.map(|p| Point::new(p.x + origin.x, p.y + origin.y))
     }
 }
 
@@ -829,8 +840,8 @@ mod tests {
 
     #[test]
     fn locked_tracking_uses_window_capture_and_still_follows() {
-        let mut img = RgbImage::new(200, 200);
-        paint_block(&mut img, 50, 60, 10, 10, [255, 0, 0]);
+        let mut img = RgbImage::new(400, 400);
+        paint_block(&mut img, 150, 160, 10, 10, [255, 0, 0]);
         let mut f = TrackingBobberFinder::new(
             PixelClassifier::new(),
             SpyCapture {
@@ -840,12 +851,26 @@ mod tests {
         );
         assert_eq!(f.find(), None, "首帧确认中");
         let locked = f.find().expect("第 2 帧应锁定");
+        assert!((ORIGIN.x + 150..ORIGIN.x + 160).contains(&locked.x));
+        assert!((ORIGIN.y + 160..ORIGIN.y + 170).contains(&locked.y));
         let followed = f.find().expect("锁定后小窗截屏仍应跟踪");
         assert_eq!(followed, locked);
 
+        // 强制预览切回全帧，再次切回小窗；屏幕位置不能随捕获方式改变。
+        let (tx, rx) = crate::latest::channel();
+        f.set_frame_handler(tx);
+        assert_eq!(f.find(), Some(locked));
+        let preview = rx.recv().unwrap();
+        assert_eq!(preview.frame.origin, ORIGIN);
+        assert_eq!(
+            preview.bobber,
+            Some(Point::new(locked.x - ORIGIN.x, locked.y - ORIGIN.y))
+        );
+        assert_eq!(f.find(), Some(locked));
+
         let requests = &f.capture.requests;
         assert_eq!(requests[0], None, "全局搜索必须是全帧截屏");
-        for (i, r) in requests.iter().enumerate().skip(1) {
+        for (i, r) in requests.iter().enumerate().take(3).skip(1) {
             let r = r.unwrap_or_else(|| panic!("第 {i} 次锁定帧应使用小窗截屏"));
             assert!(r.width <= 161 && r.height <= 161, "小窗不应超过 ±80: {r:?}");
             assert!(
@@ -853,5 +878,45 @@ mod tests {
                 "小窗必须包含锁定点: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn window_capture_loss_researches_without_double_offset() {
+        let mut img = RgbImage::new(500, 400);
+        paint_block(&mut img, 150, 160, 10, 10, [255, 0, 0]);
+        let mut f = TrackingBobberFinder::new(
+            PixelClassifier::new(),
+            SpyCapture {
+                image: img,
+                requests: vec![],
+            },
+        )
+        .with_config(TrackingConfig {
+            confirm_frames: 1,
+            lost_tolerance: Duration::ZERO,
+            ..TrackingConfig::default()
+        });
+        let old = f.find().unwrap();
+        assert_eq!(f.find(), Some(old));
+        f.capture.image = RgbImage::new(500, 400);
+        paint_block(&mut f.capture.image, 350, 260, 10, 10, [255, 0, 0]);
+        let new = f.find().unwrap();
+        assert!((ORIGIN.x + 350..ORIGIN.x + 360).contains(&new.x));
+        assert!((ORIGIN.y + 260..ORIGIN.y + 270).contains(&new.y));
+        assert_eq!(f.find(), Some(new));
+    }
+
+    #[test]
+    fn failed_capture_cannot_return_stale_screen_position() {
+        let mut f = finder_with(vec![
+            red_block_image(400, 400, 150, 160, 10),
+            RgbImage::new(1, 1),
+        ])
+        .with_config(TrackingConfig {
+            confirm_frames: 1,
+            ..TrackingConfig::default()
+        });
+        assert!(f.find().is_some());
+        assert_eq!(f.find(), None);
     }
 }

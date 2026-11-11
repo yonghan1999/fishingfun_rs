@@ -25,8 +25,15 @@ pub trait ScreenCapture {
         let (w, h) = (frame.image.width() as i32, frame.image.height() as i32);
         let x = region.x.clamp(0, w);
         let y = region.y.clamp(0, h);
-        let cw = region.width.min(w - x).max(1) as u32;
-        let ch = region.height.min(h - y).max(1) as u32;
+        let cw = region.width.min(w - x);
+        let ch = region.height.min(h - y);
+        if cw <= 0 || ch <= 0 {
+            return CapturedFrame {
+                image: RgbImage::new(1, 1),
+                origin: Point::EMPTY,
+            };
+        }
+        let (cw, ch) = (cw as u32, ch as u32);
         let image = image::imageops::crop_imm(&frame.image, x as u32, y as u32, cw, ch).to_image();
         CapturedFrame {
             image,
@@ -52,23 +59,58 @@ pub trait BiteWatcher {
 
 /// 按键发送能力（对应 WowProcess.PressKey/KeyDown/KeyUp）。
 pub trait KeySender {
-    fn press_key(&mut self, key: Key);
-    fn key_down(&mut self, key: Key);
-    fn key_up(&mut self, key: Key);
+    fn press_key(&mut self, key: Key) -> InputResult;
+    fn key_down(&mut self, key: Key) -> InputResult;
+    fn key_up(&mut self, key: Key) -> InputResult;
+
+    /// 取消后不再产生新的按下；平台实现可中断保持时间，但必须先释放已按下的键。
+    fn press_key_cancellable(
+        &mut self,
+        key: Key,
+        cancel: &crate::cancellation::CancellationToken,
+    ) -> InputResult {
+        if cancel.is_cancelled() {
+            Err(InputError::Cancelled)
+        } else {
+            self.press_key(key)
+        }
+    }
 }
+
+/// 输入失败必须由调用方处理，不能把检测成功误认为操作成功。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InputError {
+    #[error("操作已取消或会话已到期")]
+    Cancelled,
+    #[error("绑定的目标窗口已关闭或不再属于原进程")]
+    TargetUnavailable,
+    #[error("目标窗口不在前台，请切回游戏后重新开始")]
+    NotForeground,
+    #[error("点击位置不属于绑定的目标窗口")]
+    OutsideTarget,
+    #[error("系统拒绝输入或光标操作")]
+    Rejected,
+}
+
+pub type InputResult = Result<(), InputError>;
 
 /// 鼠标能力（对应 WowProcess.RightClickMouse 等）。
 pub trait MouseController {
-    fn right_click_at(&mut self, position: Point);
+    fn right_click_at(&mut self, position: Point) -> InputResult;
+
+    /// 节奏和鼠标行为使用同一开关；无此能力的实现无需处理。
+    fn set_humanize(&mut self, _enabled: bool) {}
 
     /// 平台实现可进一步在拾取前等待期间响应取消。
     fn right_click_cancellable(
         &mut self,
         position: Point,
         cancel: &crate::cancellation::CancellationToken,
-    ) {
-        if !cancel.is_cancelled() {
-            self.right_click_at(position);
+    ) -> InputResult {
+        if cancel.is_cancelled() {
+            Err(InputError::Cancelled)
+        } else {
+            self.right_click_at(position)
         }
     }
 }

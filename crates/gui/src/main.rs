@@ -6,7 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Cursor;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, SyncSender};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -19,9 +19,11 @@ use fishing_core::events::FishingEvent;
 use fishing_core::fish_bot::FishingBot;
 use fishing_core::humanize::HumanizerConfig;
 use fishing_core::tracking_finder::TrackingBobberFinder;
-use fishing_core::traits::{Key, KeySender};
+use fishing_core::traits::{InputError, Key, KeySender};
 use fishing_core::{Point, Rect};
-use fishing_platform_windows::{WowKeySender, WowMouseController, WowScreenCapture, LOOT_DELAY_MS};
+use fishing_platform_windows::{
+    WowKeySender, WowMouseController, WowScreenCapture, WowTarget, LOOT_DELAY_MS,
+};
 use image::{ImageFormat, Rgb, RgbImage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -38,6 +40,7 @@ struct AppState {
     search_region: Arc<RwLock<Option<Rect>>>,
     bot: Sessions,
     config: ConfigStore,
+    closing: AtomicBool,
 }
 
 // ---------------------------------------------------------------- 日志桥接
@@ -187,6 +190,10 @@ fn bot_status(state: State<AppState>) -> BotStatus {
 
 #[tauri::command]
 fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if state.closing.load(Ordering::Acquire) {
+        return Err("应用正在退出".into());
+    }
+    let target = WowTarget::find().map_err(|e| e.to_string())?;
     let config = state.config.get();
     let key = Key::from_console_key_value(config.cast_key).ok_or("抛竿键无效")?;
     let session = state.bot.reserve(key, config.strike_value)?;
@@ -199,13 +206,24 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         .name("fishing-session".into())
         .spawn(move || {
             let session = worker_session;
+            let mut frame_thread = None;
+            let mut event_thread = None;
             // 即使线程 panic，仍取消桥接线程并清理本次会话。
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if session.cancel.is_cancelled() {
                     return;
                 }
-                let mut keys = WowKeySender::new();
-                keys.press_key(Key::SPACEBAR);
+                tracing::info!("请在十秒内切回游戏窗口。");
+                let mut keys = WowKeySender::new(target);
+                if let Err(error) = target
+                    .wait_foreground(&session.cancel)
+                    .and_then(|_| keys.press_key_cancellable(Key::SPACEBAR, &session.cancel))
+                {
+                    if error != InputError::Cancelled {
+                        let _ = app2.emit("bot-error", error.to_string());
+                    }
+                    return;
+                }
                 if !session.cancel.wait(Duration::from_millis(1500)) || !session.run() {
                     return;
                 }
@@ -215,7 +233,7 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 let frame_app = app2.clone();
                 let frame_classifier = classifier.clone();
                 let frame_cancel = session.cancel.clone();
-                let frame_thread = std::thread::spawn(move || {
+                frame_thread = Some(std::thread::spawn(move || {
                     while let Some(ev) = frame_rx.recv() {
                         if frame_cancel.is_cancelled() {
                             break;
@@ -231,18 +249,18 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                             let _ = frame_app.emit("frame", payload);
                         }
                     }
-                });
+                }));
                 let (ev_tx, ev_rx) = channel::<FishingEvent>();
                 let ev_app = app2.clone();
                 let event_cancel = session.cancel.clone();
-                let event_thread = std::thread::spawn(move || {
+                event_thread = Some(std::thread::spawn(move || {
                     while let Ok(ev) = ev_rx.recv() {
                         if event_cancel.is_cancelled() {
                             break;
                         }
                         let _ = ev_app.emit("fishing-event", ev);
                     }
-                });
+                }));
                 let mut finder = TrackingBobberFinder::new_shared(
                     classifier,
                     search_region,
@@ -257,8 +275,8 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 let mut bot = FishingBot::new(
                     Box::new(finder),
                     Box::new(PositionBiteWatcher::new(session.strike)),
-                    Box::new(WowKeySender::new()),
-                    Box::new(WowMouseController::new()),
+                    Box::new(WowKeySender::new(target)),
+                    Box::new(WowMouseController::new(target)),
                     key,
                     vec![Key::D5, Key::D6],
                     ev_tx,
@@ -266,14 +284,22 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 .with_session(session.cancel.clone(), session.cast_key.clone())
                 .with_humanizer(humanize_cfg);
                 bot.start();
+                if let Some(error) = bot.last_error() {
+                    let _ = app2.emit("bot-error", error.to_string());
+                }
                 session.cancel.cancel();
                 drop(bot);
-                let _ = frame_thread.join();
-                let _ = event_thread.join();
             }));
             session.cancel.cancel();
+            // panic 展开同样会释放生产端；标记会话结束前必须回收桥接线程。
+            for worker in [frame_thread, event_thread].into_iter().flatten() {
+                if worker.join().is_err() {
+                    tracing::error!("会话桥接线程异常退出");
+                }
+            }
             if result.is_err() {
                 tracing::error!("Bot worker panicked");
+                let _ = app2.emit("bot-error", "机器人异常退出，请查看日志");
             }
             if let Some(state) = app2.try_state::<AppState>() {
                 // 在会话锁仍占位时发送退出事件，防止新会话先启动后收到旧退出通知。
@@ -504,7 +530,27 @@ fn main() {
                 && matches!(event, tauri::WindowEvent::CloseRequested { .. })
             {
                 if let Some(session) = window.state::<AppState>().bot.current() {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                    }
                     session.stop();
+                    let state = window.state::<AppState>();
+                    if !state.closing.swap(true, Ordering::AcqRel) {
+                        let app = window.app_handle().clone();
+                        std::thread::spawn(move || {
+                            if session.wait_finished(Duration::from_secs(10)) {
+                                app.exit(0);
+                            } else {
+                                app.state::<AppState>()
+                                    .closing
+                                    .store(false, Ordering::Release);
+                                let _ = app.emit(
+                                    "bot-error",
+                                    "停止清理超过十秒，应用暂未退出，请稍后重试关闭",
+                                );
+                            }
+                        });
+                    }
                 }
             }
         })
@@ -518,6 +564,7 @@ fn main() {
                 search_region: Arc::new(RwLock::new(settings.search_region)),
                 bot: Sessions::default(),
                 config,
+                closing: AtomicBool::new(false),
             });
             // C# MainWindow 构造：pixelClassifier.SetConfiguration(IsWowClassic())
             {

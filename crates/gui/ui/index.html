@@ -24,7 +24,7 @@
 
     <!-- 右上：工具按钮卡 -->
     <div class="card" id="toolbarCard">
-      <button id="btnPlay" class="tool-btn" title="开始">
+      <button id="btnPlay" class="tool-btn" title="开始后请在十秒内切回游戏窗口">
         <img id="playImg" src="assets/play.png" alt="Start" />
         <img id="playImgDisabled" src="assets/play_disabled.png" alt="" class="hidden" />
       </button>
@@ -40,7 +40,7 @@
         <input id="castKeyInput" maxlength="1" value="4" autocomplete="off" />
       </button>
       <!-- 拟人化节奏开关（扩展功能，持久化到 settings.json，下次启动生效） -->
-      <label id="humanizeLabel" title="模拟人类节奏：随机反应延迟、抛竿停顿、周期休息、宏键抖动">
+      <label id="humanizeLabel" title="下次启动生效：随机反应延迟、抛竿停顿、周期休息、宏键抖动和鼠标移动">
         <input type="checkbox" id="humanizeToggle" checked />
         <span>拟人化</span>
       </label>

@@ -60,6 +60,7 @@ test("日志条目有上限，启动失败恢复按钮，图表使用后端实�
         if (command === "start_bot") throw new Error("spawn failed");
         if (command === "bot_status") return { phase: "Idle", strike_value: 23 };
         if (command === "get_cast_key") return "4";
+        if (command === "get_humanize") return true;
       },
       __TAURI__: { event: { listen(name, fn) { listeners[name] = fn; } } },
       addEventListener(_, fn) { domReady = fn; },
@@ -80,4 +81,44 @@ test("日志条目有上限，启动失败恢复按钮，图表使用后端实�
   await assert.rejects(elements.get("btnPlay").handlers.click(), /spawn failed/);
   assert.equal(elements.get("btnPlay").disabled, false);
   assert.equal(elements.get("btnStop").disabled, true);
+});
+
+test("拟人化保存失败恢复已保存状态，保存期间禁用，后台错误可见", async () => {
+  const elements = new Map();
+  const listeners = {};
+  let rejectSave;
+  let backendError;
+  const context = vm.createContext({
+    window: {
+      invokeWithFeedback: async command => {
+        if (command === "get_humanize") return false;
+        if (command === "set_humanize") return new Promise((_, reject) => { rejectSave = reject; });
+      },
+      showOperationError(error) { backendError = error; },
+      __TAURI__: { event: { listen(name, fn) { listeners[name] = fn; } } },
+      addEventListener() {},
+    },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; } });
+        return elements.get(id);
+      },
+      querySelectorAll() { return []; },
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(ui, "app.js"), "utf8"), context);
+  const toggle = elements.get("humanizeToggle");
+  assert.equal(toggle.disabled, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(toggle.checked, false);
+  assert.equal(toggle.disabled, false);
+  toggle.checked = true;
+  const saving = toggle.handlers.change();
+  assert.equal(toggle.disabled, true);
+  rejectSave(new Error("disk full"));
+  await saving;
+  assert.equal(toggle.checked, false);
+  assert.equal(toggle.disabled, false);
+  listeners["bot-error"]({ payload: "目标窗口不在前台" });
+  assert.equal(backendError, "目标窗口不在前台");
 });

@@ -16,7 +16,9 @@ use rand::Rng;
 use crate::events::{FishingAction, FishingEvent};
 use crate::humanize::{Humanizer, HumanizerConfig};
 use crate::timed_action::TimedAction;
-use crate::traits::{BiteWatcher, BobberFinder, Key, KeySender, MouseController};
+use crate::traits::{
+    BiteWatcher, BobberFinder, InputError, InputResult, Key, KeySender, MouseController,
+};
 use crate::Point;
 
 /// 对应 C# FishingBot。
@@ -35,6 +37,7 @@ pub struct FishingBot {
     start_time: Instant,
     /// 拟人化节奏（扩展功能；默认关闭，保持 C# 保真节拍）
     humanizer: Humanizer,
+    last_error: Option<InputError>,
 }
 
 impl FishingBot {
@@ -59,6 +62,7 @@ impl FishingBot {
             events,
             start_time: Instant::now(),
             humanizer: Humanizer::disabled(),
+            last_error: None,
         }
     }
 
@@ -69,6 +73,10 @@ impl FishingBot {
 
         if self.cancel.is_cancelled() {
             return;
+        }
+
+        if let Some(deadline) = self.humanizer.start_session() {
+            self.cancel.set_deadline(deadline);
         }
 
         self.do_ten_minute_key();
@@ -99,8 +107,11 @@ impl FishingBot {
                 break;
             }
 
+            let result = self.keys.press_key_cancellable(cast_key, &self.cancel);
+            if !self.handle_input(result) {
+                break;
+            }
             self.emit(FishingEvent::new(FishingAction::Cast));
-            self.keys.press_key(cast_key);
 
             if !self.is_enabled() {
                 break;
@@ -116,7 +127,10 @@ impl FishingBot {
             }
         }
 
-        tracing::error!("Bot has Stopped.");
+        if self.humanizer.session_expired() {
+            tracing::info!("已达到最长运行时长，自动停止。");
+        }
+        tracing::info!("Bot has Stopped.");
     }
 
     /// 对应 C# SetCastKey（UI 线程调用，bot 运行中实时生效）。
@@ -156,12 +170,31 @@ impl FishingBot {
 
     /// 拟人化节奏（扩展功能）；默认关闭以保持 C# 保真节拍。
     pub fn with_humanizer(mut self, cfg: HumanizerConfig) -> Self {
+        self.mouse.set_humanize(cfg.enabled());
         self.humanizer = Humanizer::new(cfg);
         self
     }
 
     fn is_enabled(&self) -> bool {
         !self.cancel.is_cancelled()
+    }
+
+    pub fn last_error(&self) -> Option<InputError> {
+        self.last_error
+    }
+
+    fn handle_input(&mut self, result: InputResult) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                if error != InputError::Cancelled {
+                    tracing::error!("输入失败，已停止本次会话：{error}");
+                    self.last_error = Some(error);
+                }
+                self.cancel.cancel();
+                false
+            }
+        }
     }
 
     fn emit(&self, ev: FishingEvent) {
@@ -252,9 +285,6 @@ impl FishingBot {
             );
         }
 
-        // C# 原行为：即使没有按键也发 Cast 事件
-        self.emit(FishingEvent::new(FishingAction::Cast));
-
         for key in self.ten_min_key.clone() {
             if !self.is_enabled() {
                 break;
@@ -263,14 +293,25 @@ impl FishingBot {
                 "Ten Minute Key: Pressing key {:?} to run a macro, delete junk fish or apply a lure etc.",
                 key
             );
-            self.keys.press_key(key);
+            let result = self.keys.press_key_cancellable(key, &self.cancel);
+            if !self.handle_input(result) {
+                return;
+            }
+        }
+        // 空列表仍保留原 Cast 事件，但输入失败不能报告成功。
+        if self.is_enabled() {
+            self.emit(FishingEvent::new(FishingAction::Cast));
         }
     }
 
     fn loot(&mut self, bobber_position: Point) {
         tracing::info!("Right clicking mouse to Loot.");
-        self.mouse
+        let result = self
+            .mouse
             .right_click_cancellable(bobber_position, &self.cancel);
+        if self.handle_input(result) {
+            self.emit(FishingEvent::new(FishingAction::Loot));
+        }
     }
 
     /// 对应 C# Sleep：附加 0..225ms 随机量，分 100ms 片段睡眠。
@@ -424,21 +465,31 @@ mod tests {
     }
 
     impl KeySender for RecordedKeys {
-        fn press_key(&mut self, key: Key) {
+        fn press_key(&mut self, key: Key) -> InputResult {
             self.pressed.lock().unwrap().push(key);
+            Ok(())
         }
-        fn key_down(&mut self, _key: Key) {}
-        fn key_up(&mut self, _key: Key) {}
+        fn key_down(&mut self, _key: Key) -> InputResult {
+            Ok(())
+        }
+        fn key_up(&mut self, _key: Key) -> InputResult {
+            Ok(())
+        }
     }
 
     #[derive(Default, Clone)]
     struct RecordedMouse {
         right_clicks: Arc<Mutex<Vec<Point>>>,
+        humanize: Arc<Mutex<bool>>,
     }
 
     impl MouseController for RecordedMouse {
-        fn right_click_at(&mut self, position: Point) {
+        fn set_humanize(&mut self, enabled: bool) {
+            *self.humanize.lock().unwrap() = enabled;
+        }
+        fn right_click_at(&mut self, position: Point) -> InputResult {
             self.right_clicks.lock().unwrap().push(position);
+            Ok(())
         }
     }
 
@@ -472,9 +523,12 @@ mod tests {
             &[bobber],
             "咬钩后应在初始浮漂位置右键拾取"
         );
-        // bite watcher 的 reset 不经过 bot 事件，Loot 由 watcher 发送；
-        // 此处 watcher 是 mock，故只验证未崩溃与鼠标行为。
-        drop(rx);
+        assert_eq!(
+            rx.try_iter()
+                .filter(|ev| ev.action == FishingAction::Loot)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -603,6 +657,80 @@ mod tests {
     fn humanizer_disabled_by_default_keeps_fidelity_timing() {
         let (bot, _, _) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
         assert_eq!(bot.humanizer.ten_min_period(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn humanize_switch_controls_mouse_and_timing_together() {
+        let (bot, _, _) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        let mouse = RecordedMouse::default();
+        let enabled = mouse.humanize.clone();
+        let mut bot = bot;
+        bot.mouse = Box::new(mouse);
+        bot = bot.with_humanizer(HumanizerConfig::default());
+        assert!(*enabled.lock().unwrap());
+        let _bot = bot.with_humanizer(HumanizerConfig::disabled());
+        assert!(!*enabled.lock().unwrap());
+    }
+
+    struct FailingInput;
+    impl KeySender for FailingInput {
+        fn press_key(&mut self, _: Key) -> InputResult {
+            Err(InputError::NotForeground)
+        }
+        fn key_down(&mut self, _: Key) -> InputResult {
+            Err(InputError::NotForeground)
+        }
+        fn key_up(&mut self, _: Key) -> InputResult {
+            Ok(())
+        }
+    }
+    impl MouseController for FailingInput {
+        fn right_click_at(&mut self, _: Point) -> InputResult {
+            Err(InputError::Rejected)
+        }
+    }
+
+    #[test]
+    fn failed_macro_stops_before_casting() {
+        let (mut bot, _, clicks) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        bot.keys = Box::new(FailingInput);
+        bot.start();
+        assert_eq!(bot.last_error(), Some(InputError::NotForeground));
+        assert!(bot.stop_handle().is_cancelled());
+        assert!(clicks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_loot_stops_without_emitting_loot() {
+        let (mut bot, _) = humanized_bot(HumanizerConfig::disabled());
+        let (tx, rx) = channel();
+        bot.events = tx;
+        bot.mouse = Box::new(FailingInput);
+        bot.wait_for_bite();
+        assert_eq!(bot.last_error(), Some(InputError::Rejected));
+        assert!(bot.stop_handle().is_cancelled());
+        assert!(!rx.try_iter().any(|ev| ev.action == FishingAction::Loot));
+    }
+
+    #[test]
+    fn session_deadline_stops_observation_and_reaction_before_loot() {
+        for observe in [true, false] {
+            let (mut bot, clicks) = humanized_bot(HumanizerConfig {
+                reaction_ms: (5000, 5000),
+                ..HumanizerConfig::disabled()
+            });
+            bot.cancel
+                .set_deadline(Instant::now() + Duration::from_millis(30));
+            let start = Instant::now();
+            if observe {
+                bot.watch(2000);
+            } else {
+                bot.wait_for_bite();
+            }
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(bot.cancel.is_cancelled());
+            assert!(clicks.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

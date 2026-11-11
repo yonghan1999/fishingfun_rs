@@ -89,7 +89,7 @@ impl BiteWatcher for PositionBiteWatcher {
         }
 
         if threshold_reached {
-            self.raise_event(FishingEvent::new(FishingAction::Loot));
+            // 这里只报告咬钩判定，Loot 由机器人在鼠标操作成功后发出。
             if let Some(timer) = &mut self.timer {
                 timer.execute_now();
             }
@@ -131,10 +131,10 @@ mod tests {
         // 下沉 7 像素（达到 strikeValue）
         assert!(w.is_bite(Point::new(100, 208)));
 
-        // 应收到 Reset（reset 时）与 Loot 事件
+        // 检测到咬钩不代表已经执行拾取。
         let actions: Vec<_> = rx.try_iter().map(|e| e.action).collect();
         assert!(actions.contains(&FishingAction::Reset));
-        assert!(actions.contains(&FishingAction::Loot));
+        assert!(!actions.contains(&FishingAction::Loot));
     }
 
     #[test]

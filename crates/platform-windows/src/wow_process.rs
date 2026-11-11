@@ -3,23 +3,20 @@
 //! - 进程名匹配：Wow / WowClassic / Wow-64，小写比较（C# ProcessName 无扩展名，
 //!   Toolhelp32 的 szExeFile 带 .exe，需先剥掉）；
 //! - 按键：保持 50 + [0,75)ms 后抬起（与 C# 一致）；
-//! - 拾取用 LiamCooper 流程：RightUp → 拟人化移动 → 等 LootDelay → RightDown/Up →
-//!   恢复原窗口焦点与光标；
-//! - 找不到 WoW 进程时记日志并跳过（C# 返回 null 后同样跳过，不抛异常）。
+//! - 输入绑定会话目标；每次新输入前验证前台归属，失败停止会话；
+//! - 按下的键鼠必须成对释放，释放不受失焦或取消影响。
 //!
 //! 有意偏离 C#：输入注入从 PostMessage/ mouse_event 迁移到 SendInput。
-//! PostMessage 绕过系统输入队列（无扫描码、无队列上下文，是行为检测的典型特征）；
-//! SendInput 进入 win32k 输入流，与真实输入走同一路径。代价是按键由前台窗口
-//! 接收：WoW 不在前台时会记警告日志（拾取的光标移动本来就要求游戏可见）。
+//! SendInput 进入系统输入流，由前台窗口接收；仍属于可识别的注入输入。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fishing_core::cancellation::CancellationToken;
-use fishing_core::traits::{Key, KeySender, MouseController};
+use fishing_core::traits::{InputError, InputResult, Key, KeySender, MouseController};
 use fishing_core::Point;
 use rand::Rng;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -30,14 +27,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SetCursorPos, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
+    IsWindow, IsWindowVisible, WindowFromPoint, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
-
-/// C# Keys.cs 中 VK_RMB（PostMessage 鼠标消息的 wParam）
-const VK_RMB: usize = 0x02;
 
 /// 对应 C# WowProcess.LootDelay 静态字段（GUI 颜色配置窗口可实时改）。
 pub static LOOT_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
@@ -153,14 +146,6 @@ fn main_window_of_process(pid: u32) -> Option<HWND> {
     state.hwnd
 }
 
-fn window_title(hwnd: HWND) -> String {
-    unsafe {
-        let mut buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        String::from_utf16_lossy(&buf[..len as usize])
-    }
-}
-
 /// 前台窗口进程的主窗口（对应 C# GetActiveProcess().MainWindowHandle）。
 fn active_window() -> Option<HWND> {
     unsafe {
@@ -174,20 +159,103 @@ fn active_window() -> Option<HWND> {
 }
 
 /// 对应 C# WowProcess 的按键功能（实现 core KeySender）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WowKeySender {
+    target: WowTarget,
     last_key: Option<Key>,
 }
 
 impl WowKeySender {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(target: WowTarget) -> Self {
+        Self {
+            target,
+            last_key: None,
+        }
+    }
+}
+
+/// 会话只绑定一次目标，使用整数保存窗口标识以便在线程间传递。
+#[derive(Debug, Clone, Copy)]
+pub struct WowTarget {
+    pid: u32,
+    window: isize,
+}
+
+impl WowTarget {
+    pub fn find() -> Result<Self, InputError> {
+        let wow = find_wow_process(None).ok_or(InputError::TargetUnavailable)?;
+        let target = Self {
+            pid: wow.pid,
+            window: wow.main_window.0 as isize,
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    fn hwnd(self) -> HWND {
+        HWND(self.window as *mut _)
+    }
+
+    fn validate(self) -> InputResult {
+        let mut pid = 0;
+        unsafe {
+            if !IsWindow(self.hwnd()).as_bool() {
+                return Err(InputError::TargetUnavailable);
+            }
+            GetWindowThreadProcessId(self.hwnd(), Some(&mut pid));
+        }
+        if pid != self.pid {
+            return Err(InputError::TargetUnavailable);
+        }
+        Ok(())
+    }
+
+    pub fn check_foreground(self) -> InputResult {
+        self.validate()?;
+        if active_window() != Some(self.hwnd()) {
+            return Err(InputError::NotForeground);
+        }
+        Ok(())
+    }
+
+    /// 开始按钮会使 GUI 获得焦点，最多等待十秒让用户切回目标窗口。
+    pub fn wait_foreground(self, cancel: &CancellationToken) -> InputResult {
+        let start = std::time::Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(InputError::Cancelled);
+            }
+            match self.check_foreground() {
+                Ok(()) => return Ok(()),
+                Err(InputError::NotForeground) if start.elapsed() < Duration::from_secs(10) => {}
+                Err(error) => return Err(error),
+            }
+            if !cancel.wait(Duration::from_millis(25)) {
+                return Err(InputError::Cancelled);
+            }
+        }
+    }
+
+    fn check_point(self, point: Point) -> InputResult {
+        self.check_foreground()?;
+        let mut pid = 0;
+        unsafe {
+            let window = WindowFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            });
+            GetWindowThreadProcessId(window, Some(&mut pid));
+        }
+        if pid != self.pid {
+            return Err(InputError::OutsideTarget);
+        }
+        Ok(())
     }
 }
 
 /// SendInput 注入一次按键：虚拟键码 + 扫描码（MapVirtualKeyW 取得），
-/// 扩展键补 KEYEVENTF_EXTENDEDKEY。返回 false 表示被 UIPI 等拦截。
-fn send_key(key: Key, key_up: bool) -> bool {
+/// 扩展键补 KEYEVENTF_EXTENDEDKEY。失败时向调用方报告。
+fn send_key(key: Key, key_up: bool) -> InputResult {
     let vk = key.vk_code();
     let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) };
     let mut flags = KEYBD_EVENT_FLAGS(0);
@@ -217,13 +285,13 @@ fn send_key(key: Key, key_up: bool) -> bool {
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent != 1 {
         tracing::error!("SendInput 按键 {:?} 被系统拦截（UIPI 权限隔离?）", key);
-        return false;
+        return Err(InputError::Rejected);
     }
-    true
+    Ok(())
 }
 
 /// 注入一次鼠标事件。绝对移动时 dx/dy 需归一化到虚拟桌面 0..=65535。
-fn send_mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> bool {
+fn send_mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> InputResult {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -240,14 +308,13 @@ fn send_mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> bool {
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent != 1 {
         tracing::error!("SendInput 鼠标事件被系统拦截");
-        return false;
+        return Err(InputError::Rejected);
     }
-    true
+    Ok(())
 }
 
-/// 把光标移动到屏幕坐标 (x, y)：走输入流的绝对移动（低级钩子可见、
-/// 产生正常 WM_MOUSEMOVE），比 SetCursorPos 更接近真实鼠标。
-fn send_mouse_move(x: i32, y: i32) {
+/// 把光标移动到屏幕坐标 (x, y)，失败由调用方终止后续点击。
+fn send_mouse_move(x: i32, y: i32) -> InputResult {
     let (vx, vy, vw, vh) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -257,275 +324,219 @@ fn send_mouse_move(x: i32, y: i32) {
         )
     };
     let norm = |v: i32, origin: i32, size: i32| -> i32 {
-        (i64::from(v - origin) * 65535 / i64::from((size - 1).max(1))).clamp(0, 65535) as i32
+        ((i64::from(v) - i64::from(origin)) * 65535 / i64::from((size - 1).max(1))).clamp(0, 65535)
+            as i32
     };
     send_mouse_input(
         norm(x, vx, vw),
         norm(y, vy, vh),
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-    );
+    )
 }
 
-/// SendInput 的按键由前台窗口接收；WoW 不在前台时按键会误入其他窗口，
-/// 限频警告（30s），避免日志刷屏。
-fn warn_if_wow_not_foreground() {
-    let ok = find_wow_process(None)
-        .and_then(|wow| active_window().map(|active| active.0 == wow.main_window.0))
-        .unwrap_or(false);
-    if ok {
-        return;
-    }
-    static LAST_WARN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    if let Ok(mut last) = LAST_WARN.lock() {
-        if last.is_none_or(|time| time.elapsed() >= Duration::from_secs(30)) {
-            tracing::warn!("WoW 窗口不在前台：SendInput 按键将发送给当前前台窗口");
-            *last = Some(std::time::Instant::now());
-        }
-    }
-}
-
+/// 新按下前验证目标；配对释放不受失焦或取消影响。
 impl KeySender for WowKeySender {
-    /// C#: KeyDown → sleep(50 + Next(0,75)) → KeyUp
-    fn press_key(&mut self, key: Key) {
-        warn_if_wow_not_foreground();
-        self.key_down(key);
-        std::thread::sleep(Duration::from_millis(
+    fn press_key(&mut self, key: Key) -> InputResult {
+        self.press_key_cancellable(key, &CancellationToken::default())
+    }
+
+    fn press_key_cancellable(&mut self, key: Key, cancel: &CancellationToken) -> InputResult {
+        if cancel.is_cancelled() {
+            return Err(InputError::Cancelled);
+        }
+        self.key_down(key)?;
+        let completed = cancel.wait(Duration::from_millis(
             50 + rand::thread_rng().gen_range(0..75),
         ));
-        self.key_up(key);
+        self.key_up(key)?;
+        if completed {
+            Ok(())
+        } else {
+            Err(InputError::Cancelled)
+        }
     }
-
-    fn key_down(&mut self, key: Key) {
+    fn key_down(&mut self, key: Key) -> InputResult {
+        self.target.check_foreground()?;
+        if self.last_key.is_some() {
+            return Err(InputError::Rejected);
+        }
+        send_key(key, false)?;
         self.last_key = Some(key);
-        send_key(key, false);
+        Ok(())
     }
-
-    fn key_up(&mut self, key: Key) {
-        send_key(key, true);
+    fn key_up(&mut self, key: Key) -> InputResult {
+        if self.last_key == Some(key) {
+            // 已成功按下的键必须释放，不再检查前台，避免切屏后卡键。
+            send_key(key, true)?;
+            self.last_key = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for WowKeySender {
+    fn drop(&mut self) {
+        if let Some(key) = self.last_key {
+            let _ = send_key(key, true);
+        }
     }
 }
 
-/// 对应 C# WowProcess 的鼠标功能（实现 core MouseController）。
-#[derive(Debug, Default)]
-pub struct WowMouseController;
+// 正常返回、错误和 panic 都尝试释放已按下的右键。
+struct RightButtonGuard(bool);
+impl RightButtonGuard {
+    fn release(&mut self) -> InputResult {
+        send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP)?;
+        self.0 = false;
+        Ok(())
+    }
+}
+impl Drop for RightButtonGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP);
+        }
+    }
+}
 
+#[derive(Debug)]
+pub struct WowMouseController {
+    target: WowTarget,
+    humanize: bool,
+}
 impl WowMouseController {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// C# RightClickMouse_Original：缓慢移动后 PostMessage 右键（保留作备用）。
-    #[allow(dead_code)]
-    pub fn right_click_postmessage(&self, position: Point) {
-        let Some(wow) = find_wow_process(None) else {
-            return;
-        };
-        unsafe {
-            let mut old = POINT::default();
-            let _ = GetCursorPos(&mut old);
-
-            for i in (1..=20).rev() {
-                let _ = SetCursorPos(position.x + i, position.y + i);
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            std::thread::sleep(Duration::from_millis(1000));
-
-            let _ = PostMessageW(wow.main_window, WM_RBUTTONDOWN, WPARAM(VK_RMB), LPARAM(0));
-            std::thread::sleep(Duration::from_millis(
-                30 + rand::thread_rng().gen_range(0..47),
-            ));
-            let _ = PostMessageW(wow.main_window, WM_RBUTTONUP, WPARAM(VK_RMB), LPARAM(0));
-
-            self.refocus(wow.main_window, old);
+    pub fn new(target: WowTarget) -> Self {
+        Self {
+            target,
+            humanize: false,
         }
     }
-
-    /// C# RightClickMouse()：不移动光标的 PostMessage 右键（保留作备用）。
-    #[allow(dead_code)]
-    pub fn right_click_plain(&self) {
-        if let Some(wow) = find_wow_process(None) {
-            unsafe {
-                let _ = PostMessageW(wow.main_window, WM_RBUTTONDOWN, WPARAM(VK_RMB), LPARAM(0));
-                std::thread::sleep(Duration::from_millis(
-                    30 + rand::thread_rng().gen_range(0..47),
-                ));
-                let _ = PostMessageW(wow.main_window, WM_RBUTTONUP, WPARAM(VK_RMB), LPARAM(0));
-            }
+    fn check(&self, cancel: &CancellationToken) -> InputResult {
+        if cancel.is_cancelled() {
+            return Err(InputError::Cancelled);
         }
+        self.target.check_foreground()
     }
-
-    /// C# LeftClickMouse()（保留作备用）。
-    #[allow(dead_code)]
-    pub fn left_click_plain(&self) {
-        if let Some(wow) = find_wow_process(None) {
-            unsafe {
-                let _ = PostMessageW(wow.main_window, WM_LBUTTONDOWN, WPARAM(VK_RMB), LPARAM(0));
-                std::thread::sleep(Duration::from_millis(
-                    30 + rand::thread_rng().gen_range(0..47),
-                ));
-                let _ = PostMessageW(wow.main_window, WM_LBUTTONUP, WPARAM(VK_RMB), LPARAM(0));
-            }
+    fn move_cursor(&self, target: Point, cancel: &CancellationToken) -> InputResult {
+        self.check(cancel)?;
+        self.target.check_point(target)?;
+        if !self.humanize {
+            return send_mouse_move(target.x, target.y);
         }
-    }
-
-    /// 拟人化移动光标（扩展功能）：目标点 ±3px 随机偏移（人点不中精确像素），
-    /// 缓出曲线分步移动（起步快、收尾慢），步间 10..17ms、每步 ±2px 微扰。
-    /// 取消时光标停在中途（像人手离开鼠标），返回 false。
-    fn move_cursor_humanlike(&self, target: Point, cancel: &CancellationToken) -> bool {
         let mut rng = rand::thread_rng();
         let jittered = Point::new(
             target.x + rng.gen_range(-3..=3),
             target.y + rng.gen_range(-3..=3),
         );
+        self.target.check_point(jittered)?;
+        let mut from = POINT::default();
         unsafe {
-            let mut from = POINT::default();
-            if GetCursorPos(&mut from).is_err() {
-                return false;
-            }
-            let dx = f64::from(jittered.x - from.x);
-            let dy = f64::from(jittered.y - from.y);
-            let dist = (dx * dx + dy * dy).sqrt();
-            let steps = ((dist / 15.0) as u32).clamp(8, 45);
-            for i in 1..=steps {
-                if cancel.is_cancelled() {
-                    return false;
-                }
-                let t = f64::from(i) / f64::from(steps);
-                let ease = 1.0 - (1.0 - t).powi(3);
-                // 终点不叠加微扰，保证落点在 ±3px 目标内
-                let (jx, jy) = if i == steps {
-                    (0, 0)
-                } else {
-                    (rng.gen_range(-2..=2), rng.gen_range(-2..=2))
-                };
-                send_mouse_move(
-                    from.x + (dx * ease) as i32 + jx,
-                    from.y + (dy * ease) as i32 + jy,
-                );
-                std::thread::sleep(Duration::from_millis(10 + rng.gen_range(0..7)));
-            }
+            GetCursorPos(&mut from).map_err(|_| InputError::Rejected)?;
         }
-        true
-    }
-
-    /// C# RefocusOnOldScreen：把焦点交还给之前的窗口并恢复光标。
-    /// C# 中 KeyDown(Escape) 发给的是 WoW 进程窗口，保持一致。
-    fn refocus(&self, wow_hwnd: HWND, old_cursor: POINT) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            let Some(active) = active_window() else {
-                return;
+        let dx = f64::from(jittered.x) - f64::from(from.x);
+        let dy = f64::from(jittered.y) - f64::from(from.y);
+        let steps = ((dx.hypot(dy) / 15.0) as u32).clamp(8, 45);
+        for i in 1..=steps {
+            self.check(cancel)?;
+            let t = f64::from(i) / f64::from(steps);
+            let ease = 1.0 - (1.0 - t).powi(3);
+            let (jx, jy) = if i == steps {
+                (0, 0)
+            } else {
+                (rng.gen_range(-2..=2), rng.gen_range(-2..=2))
             };
-            if window_title(active) != window_title(wow_hwnd) {
-                // 右键点回原窗口
-                let _ = PostMessageW(active, WM_RBUTTONDOWN, WPARAM(VK_RMB), LPARAM(0));
-                std::thread::sleep(Duration::from_millis(30));
-                let _ = PostMessageW(active, WM_RBUTTONUP, WPARAM(VK_RMB), LPARAM(0));
-
-                // 向 WoW 窗口发 Escape
-                let _ = PostMessageW(
-                    wow_hwnd,
-                    WM_KEYDOWN,
-                    WPARAM(Key::ESCAPE.vk_code() as usize),
-                    LPARAM(0),
-                );
-                std::thread::sleep(Duration::from_millis(30));
-                let _ = PostMessageW(
-                    wow_hwnd,
-                    WM_KEYUP,
-                    WPARAM(Key::ESCAPE.vk_code() as usize),
-                    LPARAM(0),
-                );
-
-                let _ = SetCursorPos(old_cursor.x, old_cursor.y);
+            send_mouse_move(
+                from.x + (dx * ease) as i32 + jx,
+                from.y + (dy * ease) as i32 + jy,
+            )?;
+            if !cancel.wait(Duration::from_millis(10 + rng.gen_range(0..7))) {
+                return Err(InputError::Cancelled);
             }
-        }));
-        if let Err(e) = result {
-            tracing::error!("RefocusOnOldScreen 异常: {e:?}");
         }
+        Ok(())
     }
-}
-
-impl MouseController for WowMouseController {
-    /// C# RightClickMouse → RightClickMouse_LiamCooper 流程，逐步保真。
-    fn right_click_at(&mut self, position: Point) {
-        self.right_click_cancellable(position, &CancellationToken::default());
-    }
-
-    fn right_click_cancellable(&mut self, position: Point, cancel: &CancellationToken) {
-        if cancel.is_cancelled() {
-            return;
+    fn click(&self, position: Point, cancel: &CancellationToken) -> InputResult {
+        self.check(cancel)?;
+        if !cancel.wait(Duration::from_millis(200)) {
+            return Err(InputError::Cancelled);
         }
-        let Some(wow) = find_wow_process(None) else {
-            return;
-        };
+        self.move_cursor(position, cancel)?;
         let loot_delay = LOOT_DELAY_MS.load(Ordering::SeqCst);
-
-        unsafe {
-            // 初始 RightUp 在原光标位置（C# mouse_event 无 MOVE 标志时坐标被忽略）
-            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP);
-            let mut old = POINT::default();
-
-            if !cancel.wait(Duration::from_millis(200)) {
-                return;
-            }
-            if GetCursorPos(&mut old).is_err() {
-                return;
-            }
-            // 拟人化：替换 C# 的瞬时 SetCursorPos 瞬移（行为检测的典型特征）。
-            // 取消/失败时光标回原位，不再继续点击。
-            if !self.move_cursor_humanlike(position, cancel) {
-                send_mouse_move(old.x, old.y);
-                return;
-            }
-            if !cancel.wait(Duration::from_millis(loot_delay)) {
-                send_mouse_move(old.x, old.y);
-                return;
-            }
-            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTDOWN);
-            std::thread::sleep(Duration::from_millis(
-                30 + rand::thread_rng().gen_range(0..47),
-            ));
-            send_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP);
-
-            // 按下后必须成对释放；取消后只恢复光标，不再发送焦点/按键消息。
-            if cancel.is_cancelled() {
-                send_mouse_move(old.x, old.y);
-                return;
-            }
-            self.refocus(wow.main_window, old);
-            cancel.wait(Duration::from_millis(loot_delay / 2));
+        if !cancel.wait(Duration::from_millis(loot_delay)) {
+            return Err(InputError::Cancelled);
         }
+        self.check(cancel)?;
+        let mut actual = POINT::default();
+        unsafe {
+            GetCursorPos(&mut actual).map_err(|_| InputError::Rejected)?;
+        }
+        // 等待期间用户可能移动鼠标；不能在新位置继续点击。
+        let radius = if self.humanize { 4 } else { 1 };
+        if (i64::from(actual.x) - i64::from(position.x)).abs() > radius
+            || (i64::from(actual.y) - i64::from(position.y)).abs() > radius
+        {
+            return Err(InputError::OutsideTarget);
+        }
+        self.target.check_point(Point::new(actual.x, actual.y))?;
+        send_mouse_input(0, 0, MOUSEEVENTF_RIGHTDOWN)?;
+        let mut held = RightButtonGuard(true);
+        // 即使等待被取消也要释放，点击已发出后返回成功以准确报告事件。
+        cancel.wait(Duration::from_millis(
+            30 + rand::thread_rng().gen_range(0..47),
+        ));
+        held.release()?;
+        cancel.wait(Duration::from_millis(loot_delay / 2));
+        Ok(())
     }
 }
-
-/// 冒烟测试（见仓库 docs/development.md：以记事本为假目标）。
+impl MouseController for WowMouseController {
+    fn set_humanize(&mut self, enabled: bool) {
+        self.humanize = enabled;
+    }
+    fn right_click_at(&mut self, position: Point) -> InputResult {
+        self.right_click_cancellable(position, &CancellationToken::default())
+    }
+    fn right_click_cancellable(
+        &mut self,
+        position: Point,
+        cancel: &CancellationToken,
+    ) -> InputResult {
+        self.click(position, cancel)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    #[test]
+    fn invalid_target_rejects_input_without_injection() {
+        let target = WowTarget { pid: 0, window: 0 };
+        assert_eq!(
+            target.check_foreground(),
+            Err(InputError::TargetUnavailable)
+        );
+        let mut keys = WowKeySender::new(target);
+        assert_eq!(keys.press_key(Key::D4), Err(InputError::TargetUnavailable));
+        assert_eq!(keys.last_key, None);
+        let mut mouse = WowMouseController::new(target);
+        assert_eq!(
+            mouse.right_click_at(Point::new(100, 100)),
+            Err(InputError::TargetUnavailable)
+        );
+    }
+    #[test]
+    fn cancelled_mouse_operation_never_injects_input() {
+        let target = WowTarget { pid: 0, window: 0 };
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let mut mouse = WowMouseController::new(target);
+        assert_eq!(
+            mouse.right_click_cancellable(Point::EMPTY, &cancel),
+            Err(InputError::Cancelled)
+        );
+    }
     #[test]
     #[ignore = "需要真实 Windows 桌面会话并手动打开记事本"]
     fn finds_notepad_process_and_window() {
-        let pid = find_process_by_names(&["notepad".into()]);
-        assert!(pid.is_some(), "请先打开记事本");
-        let hwnd = main_window_of_process(pid.unwrap());
-        assert!(hwnd.is_some());
-    }
-
-    #[test]
-    #[ignore = "需要真实 Windows 桌面会话并手动打开记事本，观察字符输入"]
-    fn postmessage_types_into_notepad() {
-        // 人工验证：记事本应收到 'A' 键
         let pid = find_process_by_names(&["notepad".into()]).expect("请先打开记事本");
-        let hwnd = main_window_of_process(pid).expect("记事本窗口");
-        unsafe {
-            let _ = PostMessageW(
-                hwnd,
-                WM_KEYDOWN,
-                WPARAM(Key::A.vk_code() as usize),
-                LPARAM(0),
-            );
-            let _ = PostMessageW(hwnd, WM_KEYUP, WPARAM(Key::A.vk_code() as usize), LPARAM(0));
-        }
+        assert!(main_window_of_process(pid).is_some());
     }
 }

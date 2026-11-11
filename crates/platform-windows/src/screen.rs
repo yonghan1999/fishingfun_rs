@@ -98,6 +98,7 @@ impl WowScreenCapture {
         let (sw, sh) = primary_screen_size();
         let base = Point::new(sw / 4, sh / 4);
         let (max_w, max_h) = (sw / 2, sh / 2 - 100);
+        anyhow::ensure!(max_w > 0 && max_h > 0, "屏幕尺寸异常: {sw}x{sh}");
 
         // 裁剪到全帧范围（位图坐标）
         let x0 = region.x.clamp(0, max_w);

@@ -15,7 +15,7 @@ use fishing_core::fish_bot::FishingBot;
 use fishing_core::traits::Key;
 use fishing_core::traits::KeySender;
 use fishing_platform_windows::{
-    is_wow_classic, WowKeySender, WowMouseController, WowScreenCapture,
+    is_wow_classic, WowKeySender, WowMouseController, WowScreenCapture, WowTarget,
 };
 
 /// FishingFun console（对应 C# Console 版；原发布名为 powershell.exe 属伪装 quirk）。
@@ -55,6 +55,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let target = WowTarget::find()?;
 
     let mut pixel_classifier = PixelClassifier::new();
     if args.blue {
@@ -93,8 +94,8 @@ fn main() -> Result<()> {
     let mut bot = FishingBot::new(
         Box::new(bobber_finder),
         Box::new(bite_watcher),
-        Box::new(WowKeySender::new()),
-        Box::new(WowMouseController::new()),
+        Box::new(WowKeySender::new(target)),
+        Box::new(WowMouseController::new(target)),
         cast_key,
         ten_min_keys,
         tx,
@@ -102,11 +103,17 @@ fn main() -> Result<()> {
     .with_humanizer(humanizer_cfg);
 
     // C#: WowProcess.PressKey(ConsoleKey.Spacebar); Thread.Sleep(1500);
-    let mut keys = WowKeySender::new();
-    keys.press_key(Key::SPACEBAR);
+    tracing::info!("请在十秒内切回游戏窗口。");
+    target.wait_foreground(&bot.stop_handle())?;
+    let mut keys = WowKeySender::new(target);
+    keys.press_key_cancellable(Key::SPACEBAR, &bot.stop_handle())?;
     thread::sleep(Duration::from_millis(1500));
 
     bot.start();
+
+    if let Some(error) = bot.last_error() {
+        return Err(error.into());
+    }
 
     drop(log_thread);
     Ok(())

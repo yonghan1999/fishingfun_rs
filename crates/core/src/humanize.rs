@@ -1,4 +1,4 @@
-//! 拟人化节奏（扩展功能）：让自动化行为接近人类操作节奏，降低行为检测特征。
+//! 拟人化节奏（扩展功能）：可配置的随机等待与周期休息。
 //!
 //! - 咬钩反应延迟：人眼看到下沉到点击约需 150..450ms，原版是毫秒级立即点击；
 //! - 抛竿间隔：每轮之间随机停顿，原版是无缝衔接的固定节拍；
@@ -42,6 +42,14 @@ impl HumanizerConfig {
             max_session_mins: 0,
         }
     }
+
+    /// 鼠标与节奏使用同一开关；仅设置会话上限不启用随机行为。
+    pub fn enabled(&self) -> bool {
+        Self {
+            max_session_mins: 0,
+            ..*self
+        } != Self::disabled()
+    }
 }
 
 impl Default for HumanizerConfig {
@@ -81,9 +89,10 @@ impl Humanizer {
             next_break_at: None,
             ten_min_period: Duration::ZERO,
         };
-        h.next_break_at = h
-            .breaks_enabled()
-            .then(|| Instant::now() + Duration::from_secs(h.sample(h.cfg.break_every_mins) * 60));
+        if h.breaks_enabled() {
+            let interval = h.sample(h.cfg.break_every_mins).saturating_mul(60);
+            h.next_break_at = h.session_start.checked_add(Duration::from_secs(interval));
+        }
         h.ten_min_period = h.sample_ten_min_period();
         h
     }
@@ -122,13 +131,13 @@ impl Humanizer {
         } else {
             self.rng.gen_range(0..=self.cfg.ten_min_jitter_secs)
         };
-        Duration::from_secs(10 * 60 + jitter)
+        Duration::from_secs(600u64.saturating_add(jitter))
     }
 
-    /// 识别轮询间隔：拟人化开启时 8..=25ms 随机抖动（固定 10ms 节拍是机器特征），
+    /// 识别轮询间隔：拟人化开启时 8..=25ms 随机抖动，
     /// 关闭时固定 10ms（C# 保真）。
     pub fn poll_interval(&mut self) -> Duration {
-        if self.cfg == HumanizerConfig::disabled() {
+        if !self.cfg.enabled() {
             Duration::from_millis(10)
         } else {
             Duration::from_millis(self.rng.gen_range(8..=25))
@@ -155,15 +164,36 @@ impl Humanizer {
         if now < due {
             return None;
         }
-        let interval = Duration::from_secs(self.sample(self.cfg.break_every_mins) * 60);
-        self.next_break_at = Some(now + interval);
+        let interval =
+            Duration::from_secs(self.sample(self.cfg.break_every_mins).saturating_mul(60));
+        self.next_break_at = now.checked_add(interval);
         Some(Duration::from_secs(self.sample(self.cfg.break_secs)))
     }
 
     /// 是否超过最长连续运行时长（0 = 永不）。
     pub fn session_expired(&self) -> bool {
         self.cfg.max_session_mins > 0
-            && self.session_start.elapsed() >= Duration::from_secs(self.cfg.max_session_mins * 60)
+            && self.session_start.elapsed()
+                >= Duration::from_secs(self.cfg.max_session_mins.saturating_mul(60))
+    }
+
+    /// 从实际启动时刻计时，供核心与平台层共享截止时刻。
+    pub fn start_session(&mut self) -> Option<Instant> {
+        self.session_start = Instant::now();
+        self.next_break_at = if self.breaks_enabled() {
+            let interval = self.sample(self.cfg.break_every_mins).saturating_mul(60);
+            self.session_start
+                .checked_add(Duration::from_secs(interval))
+        } else {
+            None
+        };
+        (self.cfg.max_session_mins > 0)
+            .then(|| {
+                self.session_start.checked_add(Duration::from_secs(
+                    self.cfg.max_session_mins.saturating_mul(60),
+                ))
+            })
+            .flatten()
     }
 }
 
@@ -270,5 +300,33 @@ mod tests {
             seen.insert(ms);
         }
         assert!(seen.len() > 5, "轮询间隔缺少抖动: {:?}", seen);
+    }
+
+    #[test]
+    fn session_limit_alone_does_not_enable_random_behavior() {
+        let cfg = HumanizerConfig {
+            max_session_mins: 1,
+            ..HumanizerConfig::disabled()
+        };
+        assert!(!cfg.enabled());
+        let mut h = seeded(cfg);
+        assert_eq!(h.poll_interval(), Duration::from_millis(10));
+        let deadline = h.start_session().unwrap();
+        assert_eq!(
+            deadline.duration_since(h.session_start),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn extreme_durations_do_not_overflow_or_panic() {
+        let mut h = seeded(HumanizerConfig {
+            break_every_mins: (u64::MAX, u64::MAX),
+            break_secs: (1, 1),
+            max_session_mins: u64::MAX,
+            ..HumanizerConfig::disabled()
+        });
+        assert!(!h.session_expired());
+        h.start_session();
     }
 }

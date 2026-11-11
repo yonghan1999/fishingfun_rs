@@ -55,6 +55,7 @@ function applyStatus(status) {
 
 async function syncStatus() { applyStatus(await invoke("bot_status")); }
 listen("bot-status", () => syncStatus());
+listen("bot-error", ev => window.showOperationError(ev.payload));
 listen("bot-stopped", () => {
   if (hideCardsTimer) clearTimeout(hideCardsTimer);
   hideCardsTimer = null;
@@ -162,8 +163,25 @@ invoke("get_cast_key").then(t => { castKeyInput.value = t; });
 /* ---------------- 拟人化开关（扩展功能） ---------------- */
 
 const humanizeToggle = el("humanizeToggle");
-invoke("get_humanize").then(v => { humanizeToggle.checked = !!v; });
-humanizeToggle.addEventListener("change", () => invoke("set_humanize", { on: humanizeToggle.checked }));
+let savedHumanize = true;
+humanizeToggle.disabled = true;
+invoke("get_humanize").then(v => {
+  savedHumanize = !!v;
+  humanizeToggle.checked = savedHumanize;
+  humanizeToggle.disabled = false;
+}).catch(() => {}); // 读取失败时错误已显示，保持禁用，避免覆盖未知配置。
+humanizeToggle.addEventListener("change", async () => {
+  const requested = humanizeToggle.checked;
+  humanizeToggle.disabled = true;
+  try {
+    await invoke("set_humanize", { on: requested });
+    savedHumanize = requested;
+  } catch {
+    humanizeToggle.checked = savedHumanize;
+  } finally {
+    humanizeToggle.disabled = false;
+  }
+});
 
 /* ---------------- 初始化 ---------------- */
 
