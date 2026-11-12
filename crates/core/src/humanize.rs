@@ -6,16 +6,18 @@
 //! - 十分钟宏键抖动：触发窗口加 0..=90s 随机量，原版是精确的 600.000s 周期；
 //! - 最长会话时长：达到上限自动停止（0 = 不限）。
 //!
-//! 所有延迟都是范围采样，可注入种子 RNG 复现；`disabled()` 全零，
+//! 所有随机延迟都是范围采样，可注入种子 RNG 复现；`disabled()` 关闭随机行为，
 //! 保持 C# 保真路径与现有测试的行为/速度不变。
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
 
-/// 拟人化参数（闭区间，单位见字段名）。全零等价于关闭。
+/// 拟人化参数（闭区间，单位见字段名），宏键基础周期独立于随机行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HumanizerConfig {
+    /// 周期宏的基础间隔（秒），独立于拟人化开关。
+    pub macro_interval_secs: u64,
     /// 咬钩后到右键拾取的反应延迟
     pub reaction_ms: (u64, u64),
     /// 每轮抛竿之间的停顿
@@ -31,9 +33,10 @@ pub struct HumanizerConfig {
 }
 
 impl HumanizerConfig {
-    /// 全零配置：所有拟人化行为关闭（C# 保真路径、测试默认）。
+    /// 所有拟人化行为关闭，宏键仍保留默认十分钟周期。
     pub fn disabled() -> Self {
         HumanizerConfig {
+            macro_interval_secs: 600,
             reaction_ms: (0, 0),
             between_casts_ms: (0, 0),
             ten_min_jitter_secs: 0,
@@ -47,6 +50,7 @@ impl HumanizerConfig {
     pub fn enabled(&self) -> bool {
         Self {
             max_session_mins: 0,
+            macro_interval_secs: 600,
             ..*self
         } != Self::disabled()
     }
@@ -56,6 +60,7 @@ impl Default for HumanizerConfig {
     /// 保守的人类节奏默认值。
     fn default() -> Self {
         HumanizerConfig {
+            macro_interval_secs: 600,
             reaction_ms: (150, 450),
             between_casts_ms: (800, 2500),
             ten_min_jitter_secs: 90,
@@ -97,7 +102,7 @@ impl Humanizer {
         h
     }
 
-    /// 全零配置（等价于关闭）。
+    /// 关闭拟人化行为。
     pub fn disabled() -> Self {
         Self::new(HumanizerConfig::disabled())
     }
@@ -131,7 +136,7 @@ impl Humanizer {
         } else {
             self.rng.gen_range(0..=self.cfg.ten_min_jitter_secs)
         };
-        Duration::from_secs(600u64.saturating_add(jitter))
+        Duration::from_secs(self.cfg.macro_interval_secs.saturating_add(jitter))
     }
 
     /// 识别轮询间隔：拟人化开启时 8..=25ms 随机抖动，
@@ -144,7 +149,7 @@ impl Humanizer {
         }
     }
 
-    /// 当前十分钟宏键周期（含抖动）。
+    /// 当前宏键周期（可配置基础间隔，含抖动）。
     pub fn ten_min_period(&self) -> Duration {
         self.ten_min_period
     }
@@ -218,6 +223,7 @@ mod tests {
     #[test]
     fn samples_stay_within_configured_ranges() {
         let cfg = HumanizerConfig {
+            macro_interval_secs: 600,
             reaction_ms: (150, 450),
             between_casts_ms: (800, 2500),
             ten_min_jitter_secs: 90,
@@ -316,6 +322,26 @@ mod tests {
             deadline.duration_since(h.session_start),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn custom_macro_interval_preserves_humanize_switch_and_jitter() {
+        let cfg = HumanizerConfig {
+            macro_interval_secs: 120,
+            ..HumanizerConfig::disabled()
+        };
+        assert!(!cfg.enabled());
+        let mut h = seeded(cfg);
+        assert_eq!(h.ten_min_period(), Duration::from_secs(120));
+        assert_eq!(h.poll_interval(), Duration::from_millis(10));
+        let mut h = seeded(HumanizerConfig {
+            ten_min_jitter_secs: 90,
+            ..cfg
+        });
+        for _ in 0..100 {
+            h.resample_ten_min();
+            assert!((120..=210).contains(&h.ten_min_period().as_secs()));
+        }
     }
 
     #[test]

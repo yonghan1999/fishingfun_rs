@@ -271,7 +271,7 @@ impl FishingBot {
         }
     }
 
-    /// 对应 C# PressTenMinKeyIfDue；周期含拟人化抖动（默认配置下 600..=690s）。
+    /// 对应 C# PressTenMinKeyIfDue；基础周期可配置，含拟人化抖动。
     fn press_ten_min_key_if_due(&mut self) {
         if self.start_time.elapsed() > self.humanizer.ten_min_period()
             && !self.ten_min_key.is_empty()
@@ -609,6 +609,29 @@ mod tests {
         );
         bot.press_ten_min_key_if_due();
         assert!(pressed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn configured_macro_keys_run_at_start_and_repeat_at_custom_interval() {
+        let (mut bot, pressed, _) = recorded_bot(Box::new(ScriptedFinder::new(vec![], None)));
+        bot.ten_min_key = vec![Key::A, Key::D7];
+        bot = bot.with_humanizer(HumanizerConfig {
+            macro_interval_secs: 120,
+            ..HumanizerConfig::disabled()
+        });
+        bot.do_ten_minute_key();
+        assert_eq!(*pressed.lock().unwrap(), vec![Key::A, Key::D7]);
+        bot.start_time = Instant::now() - Duration::from_secs(119);
+        bot.press_ten_min_key_if_due();
+        assert_eq!(pressed.lock().unwrap().len(), 2);
+        bot.start_time = Instant::now() - Duration::from_secs(121);
+        bot.press_ten_min_key_if_due();
+        assert_eq!(
+            *pressed.lock().unwrap(),
+            vec![Key::A, Key::D7, Key::A, Key::D7]
+        );
+        bot.press_ten_min_key_if_due();
+        assert_eq!(pressed.lock().unwrap().len(), 4);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use fishing_core::tracking_finder::TrackingBobberFinder;
 use fishing_core::traits::{InputError, Key, KeySender};
 use fishing_core::{Point, Rect};
 use fishing_platform_windows::{
-    WowKeySender, WowMouseController, WowScreenCapture, WowTarget, LOOT_DELAY_MS,
+    shutdown_system, WowKeySender, WowMouseController, WowScreenCapture, WowTarget, LOOT_DELAY_MS,
 };
 use image::{ImageFormat, Rgb, RgbImage};
 use serde::Serialize;
@@ -34,7 +34,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 mod config;
 mod session;
 use config::ConfigStore;
-use session::{Phase, Sessions};
+use session::{Phase, ScheduledAction, Sessions};
 
 struct AppState {
     /// 共享分类器（对应 C# MainWindow 与 ColourConfiguration 共享同一实例）
@@ -203,6 +203,19 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let key = Key::from_console_key_value(config.cast_key).ok_or("抛竿键无效")?;
     let session = state.bot.reserve(key, config.strike_value)?;
     let config_humanize = config.humanize;
+    let macro_keys = config
+        .macro_keys
+        .into_iter()
+        .flatten()
+        .filter_map(Key::from_console_key_value)
+        .collect();
+    let macro_interval_secs = u64::from(config.macro_interval_minutes) * 60;
+    let schedule_minutes = config.schedule_minutes;
+    let schedule_action = match config.schedule_action.as_str() {
+        "close_wow" => ScheduledAction::CloseWow,
+        "shutdown" => ScheduledAction::Shutdown,
+        _ => ScheduledAction::StopFishing,
+    };
     let classifier = state.classifier.clone();
     let search_region = state.search_region.clone();
     let app2 = app.clone();
@@ -233,6 +246,30 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                     return;
                 }
                 let _ = app2.emit("bot-status", ());
+
+                if schedule_minutes > 0 {
+                    let timer_cancel = session.cancel.clone();
+                    let timer_target = target;
+                    std::thread::spawn(move || {
+                        if timer_cancel.wait(Duration::from_secs(u64::from(schedule_minutes) * 60))
+                        {
+                            timer_cancel.cancel();
+                            match schedule_action {
+                                ScheduledAction::StopFishing => {}
+                                ScheduledAction::CloseWow => {
+                                    if let Err(error) = timer_target.terminate() {
+                                        tracing::error!("定时关闭魔兽世界失败: {error}");
+                                    }
+                                }
+                                ScheduledAction::Shutdown => {
+                                    if let Err(error) = shutdown_system() {
+                                        tracing::error!("定时关机失败: {error}");
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
 
                 let (frame_tx, frame_rx) = fishing_core::latest::channel::<FrameEvent>();
                 let frame_app = app2.clone();
@@ -272,18 +309,19 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                     WowScreenCapture::new(),
                 );
                 finder.set_frame_handler(frame_tx);
-                let humanize_cfg = if config_humanize {
+                let mut humanize_cfg = if config_humanize {
                     HumanizerConfig::default()
                 } else {
                     HumanizerConfig::disabled()
                 };
+                humanize_cfg.macro_interval_secs = macro_interval_secs;
                 let mut bot = FishingBot::new(
                     Box::new(finder),
                     Box::new(PositionBiteWatcher::new(session.strike)),
                     Box::new(WowKeySender::new(target)),
                     Box::new(WowMouseController::new(target)),
                     key,
-                    vec![Key::D5, Key::D6],
+                    macro_keys,
                     ev_tx,
                 )
                 .with_session(session.cancel.clone(), session.cast_key.clone())
@@ -354,6 +392,45 @@ fn set_cast_key(code: i32, state: State<AppState>) -> Result<bool, String> {
         *session.cast_key.lock().map_err(|e| e.to_string())? = key;
     }
     Ok(true)
+}
+
+#[derive(Serialize)]
+struct MacroSettings {
+    keys: [Option<i32>; 2],
+    labels: [String; 2],
+    minutes: u32,
+}
+
+fn macro_settings(settings: config::Settings) -> MacroSettings {
+    MacroSettings {
+        keys: settings.macro_keys,
+        labels: settings.macro_keys.map(|code| {
+            code.and_then(Key::from_console_key_value)
+                .and_then(Key::console_key_name)
+                .unwrap_or("未设置")
+                .to_string()
+        }),
+        minutes: settings.macro_interval_minutes,
+    }
+}
+
+#[tauri::command]
+fn get_macro_settings(state: State<AppState>) -> MacroSettings {
+    macro_settings(state.config.get())
+}
+
+#[tauri::command]
+fn set_macro_settings(
+    keys: [Option<i32>; 2],
+    minutes: u32,
+    state: State<AppState>,
+) -> Result<MacroSettings, String> {
+    config::validate_macro(keys, minutes)?;
+    state.config.update(|c| {
+        c.macro_keys = keys;
+        c.macro_interval_minutes = minutes;
+    })?;
+    Ok(macro_settings(state.config.get()))
 }
 
 #[derive(Serialize)]
@@ -434,6 +511,35 @@ fn set_humanize(on: bool, state: State<AppState>) -> Result<(), String> {
     state.config.update(|c| c.humanize = on)?;
     tracing::info!("拟人化节奏: {}", if on { "开启" } else { "关闭" });
     Ok(())
+}
+
+#[derive(Serialize, Clone)]
+struct ScheduleSettings {
+    minutes: u32,
+    action: String,
+}
+
+#[tauri::command]
+fn get_schedule(state: State<AppState>) -> ScheduleSettings {
+    let settings = state.config.get();
+    ScheduleSettings {
+        minutes: settings.schedule_minutes,
+        action: settings.schedule_action,
+    }
+}
+
+#[tauri::command]
+fn set_schedule(minutes: u32, action: String, state: State<AppState>) -> Result<(), String> {
+    if minutes > 7 * 24 * 60 {
+        return Err("定时分钟数必须在 0..10080 之间".into());
+    }
+    if !matches!(action.as_str(), "stop_fishing" | "close_wow" | "shutdown") {
+        return Err("定时动作无效".into());
+    }
+    state.config.update(|c| {
+        c.schedule_minutes = minutes;
+        c.schedule_action = action;
+    })
 }
 
 #[tauri::command]
@@ -595,6 +701,8 @@ fn main() {
             bot_status,
             get_cast_key,
             set_cast_key,
+            get_macro_settings,
+            set_macro_settings,
             get_classifier_config,
             set_classifier_params,
             set_classifier_mode,
@@ -604,6 +712,8 @@ fn main() {
             set_strike_value,
             get_humanize,
             set_humanize,
+            get_schedule,
+            set_schedule,
             capture_screen,
             open_colour_window,
             get_search_region,

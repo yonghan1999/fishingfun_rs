@@ -25,6 +25,7 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
@@ -39,6 +40,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// 对应 C# WowProcess.LootDelay 静态字段（GUI 颜色配置窗口可实时改）。
 pub static LOOT_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
+
+/// 请求 Windows 在当前用户权限下关机。
+pub fn shutdown_system() -> Result<(), String> {
+    std::process::Command::new("shutdown")
+        .args(["/s", "/t", "0"])
+        .status()
+        .map_err(|e| format!("无法执行系统关机：{e}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("系统关机命令失败：{status}"))
+            }
+        })
+}
 
 /// 找到的 WoW 进程信息（对应 C# Process 的所需子集）。
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +232,18 @@ impl WowTarget {
         self.validate()?;
         if active_window() != Some(self.hwnd()) {
             return Err(InputError::NotForeground);
+        }
+        Ok(())
+    }
+
+    /// 结束本次会话绑定的 WoW 进程。
+    pub fn terminate(self) -> InputResult {
+        self.validate()?;
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, false, self.pid)
+                .map_err(|_| InputError::TargetUnavailable)?;
+            TerminateProcess(process, 0).map_err(|_| InputError::Rejected)?;
+            let _ = windows::Win32::Foundation::CloseHandle(process);
         }
         Ok(())
     }

@@ -6,7 +6,7 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <!-- 主网格：行 Auto/*，列 70% / 30%（右列 min 300px） -->
+  <!-- 主网格：预览与设置分栏，右列至少 360px -->
   <div id="root">
     <!-- 左侧：截图预览区（跨两行，黑色背景 DockPanel 等价） -->
     <div id="previewArea">
@@ -44,6 +44,28 @@
         <input type="checkbox" id="humanizeToggle" checked />
         <span>拟人化</span>
       </label>
+      <fieldset id="macroPanel" disabled>
+        <legend>周期宏（下次启动生效）</legend>
+        <div class="macro-row">
+          <div class="macro-key"><label>宏键 1 <input id="macroKey1" type="text" readonly placeholder="点击后按键" aria-label="宏键 1，点击后按键" /></label><button id="clearMacroKey1" type="button">清空</button></div>
+          <div class="macro-key"><label>宏键 2 <input id="macroKey2" type="text" readonly placeholder="点击后按键" aria-label="宏键 2，点击后按键" /></label><button id="clearMacroKey2" type="button">清空</button></div>
+        </div>
+        <div class="macro-row">
+          <label>每 <input id="macroMinutes" type="number" min="1" max="10080" step="1" value="10" /> 分钟执行</label>
+          <button id="saveMacro" type="button">保存宏设置</button>
+          <span id="macroSaveStatus" role="status"></span>
+        </div>
+        <p>启动时先执行一次；拟人化开启时附加 0～90 秒延迟。两键清空可禁用宏。</p>
+      </fieldset>
+      <div id="schedulePanel" title="定时动作在本次启动后计时">
+        <label>定时 <input id="scheduleMinutes" type="number" min="0" max="10080" step="1" value="0" /> 分钟</label>
+        <select id="scheduleAction">
+          <option value="stop_fishing">停止钓鱼</option>
+          <option value="close_wow">关闭魔兽世界</option>
+          <option value="shutdown">关闭电脑</option>
+        </select>
+        <button id="saveSchedule" type="button">保存</button>
+      </div>
     </div>
 
     <!-- 右下：图表 Flipper + 日志 Flipper -->

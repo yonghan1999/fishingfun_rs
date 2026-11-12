@@ -5,5 +5,6 @@ pub mod wow_process;
 
 pub use screen::WowScreenCapture;
 pub use wow_process::{
-    find_wow_process, is_wow_classic, WowKeySender, WowMouseController, WowTarget, LOOT_DELAY_MS,
+    find_wow_process, is_wow_classic, shutdown_system, WowKeySender, WowMouseController, WowTarget,
+    LOOT_DELAY_MS,
 };

@@ -12,11 +12,11 @@ html, body {
 
 .hidden { display: none !important; }
 
-/* 主网格：行 Auto/*，列 70%/30%（右列 min 300px） */
+/* 主网格：预览与设置分栏，右栏至少 360px 以容纳宏设置。 */
 #root {
   display: grid;
-  grid-template-rows: auto 1fr;
-  grid-template-columns: 7fr minmax(300px, 3fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: 7fr minmax(360px, 3fr);
   width: 100%; height: 100%;
 }
 
@@ -119,6 +119,37 @@ html, body {
 }
 #humanizeToggle { cursor: pointer; }
 
+#macroPanel {
+  width: calc(100% - 20px);
+  min-width: 0;
+  margin: 0 8px 10px 10px;
+  padding: 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 12px;
+}
+#macroPanel legend { padding: 0 4px; }
+.macro-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.macro-key { display: flex; align-items: center; gap: 6px; }
+#macroPanel input { width: 70px; padding: 3px; }
+#macroPanel input[readonly] { cursor: pointer; }
+#macroPanel button { padding: 3px 6px; }
+#macroPanel p { color: #555; line-height: 1.5; }
+#macroSaveStatus { flex-basis: 100%; min-height: 18px; color: #27632a; }
+
+#schedulePanel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin: 0 8px 5px 10px;
+  width: 100%;
+  font-size: 12px;
+}
+#scheduleMinutes { width: 68px; }
+#scheduleAction { min-width: 120px; }
+#saveSchedule { padding: 2px 8px; }
+
 /* 按键绑定文本框（KeyBindChooser：FontSize 24、透明、居中） */
 #castKeyInput {
   position: relative;
@@ -137,7 +168,7 @@ html, body {
   grid-row: 2;
   grid-column: 2;
   display: grid;
-  grid-template-rows: 250px 1fr;   /* 图表卡 250 高，日志卡剩余 */
+  grid-template-rows: minmax(60px, 1fr) minmax(60px, 1fr);
   margin: 5px 5px 5px 0;
   row-gap: 15px;                    /* Flipper Margin 0 15 0 0 */
 }

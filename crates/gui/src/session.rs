@@ -13,6 +13,13 @@ pub enum Phase {
     Stopping,
 }
 
+#[derive(Clone, Copy, Serialize, PartialEq, Eq, Debug)]
+pub enum ScheduledAction {
+    StopFishing,
+    CloseWow,
+    Shutdown,
+}
+
 pub struct Session {
     pub cancel: CancellationToken,
     pub cast_key: Arc<Mutex<Key>>,

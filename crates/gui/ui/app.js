@@ -141,13 +141,18 @@ castKeyInput.addEventListener("focus", () => { castKeyInput.value = ""; });
 /* C# KeyBind_KeyUp：WPF e.Key → ConsoleKey 直转（数值==VK 码），成功才保存；
  * 失败则文本框清空。WebView2 的 KeyboardEvent.keyCode 即 Win32 VK 码，
  * 与 ConsoleKey 数值一一对应，天然覆盖全键盘（含 -、;、方向键等）。 */
-castKeyInput.addEventListener("keyup", async e => {
+function keyCodeFromEvent(e) {
   let code = e.keyCode || 0;
   // WPF e.Key 会把修饰键报成 Left/Right 变体；浏览器 keyCode 是通用 VK，
   // 映射到对应的 ConsoleKey 值以保持与原版一致
   if (code === 16) code = 160;      // Shift -> LeftShift
   if (code === 17) code = 162;      // Control -> LeftControl
   if (code === 18) code = 164;      // Alt -> LeftAlt
+  return code;
+}
+
+castKeyInput.addEventListener("keyup", async e => {
+  const code = keyCodeFromEvent(e);
   const ok = code ? await invoke("set_cast_key", { code }) : false;
   if (ok) {
     castKeyInput.value = await invoke("get_cast_key");
@@ -160,6 +165,59 @@ castKeyInput.addEventListener("keyup", async e => {
 
 /* 启动时读取持久化的按键（C# ReadConfiguration） */
 invoke("get_cast_key").then(t => { castKeyInput.value = t; });
+
+/* 周期宏：编辑草稿统一保存，失败保留草稿，不改变运行中的会话。 */
+const macroPanel = el("macroPanel");
+const macroInputs = [el("macroKey1"), el("macroKey2")];
+const macroMinutes = el("macroMinutes");
+const macroSaveStatus = el("macroSaveStatus");
+let macroKeys = [null, null];
+macroPanel.disabled = true;
+function showMacroSettings(settings) {
+  macroKeys = settings.keys.slice();
+  macroInputs.forEach((input, i) => { input.value = settings.labels[i]; });
+  macroMinutes.value = settings.minutes;
+}
+invoke("get_macro_settings").then(settings => {
+  showMacroSettings(settings);
+  macroPanel.disabled = false;
+}).catch(() => {});
+macroInputs.forEach((input, i) => {
+  // 阻止浏览器快捷键与文字输入，按下时捕获一次，避免修饰键抬起覆盖目标键。
+  input.addEventListener("keydown", e => {
+    if (e.key === "Tab") return;
+    e.preventDefault();
+    if (e.repeat) return;
+    const code = keyCodeFromEvent(e);
+    if (!code) return;
+    macroKeys[i] = code;
+    input.value = /^Digit\d$/.test(e.code || "") ? `D${e.key}` : (e.code || e.key);
+    macroSaveStatus.textContent = "尚未保存";
+  });
+  el(`clearMacroKey${i + 1}`).addEventListener("click", () => {
+    macroKeys[i] = null;
+    input.value = "未设置";
+    macroSaveStatus.textContent = "尚未保存";
+  });
+});
+macroMinutes.addEventListener("input", () => { macroSaveStatus.textContent = "尚未保存"; });
+el("saveMacro").addEventListener("click", async () => {
+  const minutes = Number(macroMinutes.value);
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10080) {
+    window.showOperationError("宏键周期必须为 1..10080 分钟的整数");
+    return;
+  }
+  macroPanel.disabled = true;
+  try {
+    const settings = await invoke("set_macro_settings", { keys: macroKeys.slice(), minutes });
+    showMacroSettings(settings);
+    macroSaveStatus.textContent = "已保存，下次启动生效";
+  } catch {
+    macroSaveStatus.textContent = "保存失败，请重试";
+  } finally {
+    macroPanel.disabled = false;
+  }
+});
 
 /* ---------------- 拟人化开关（扩展功能） ---------------- */
 
@@ -181,6 +239,28 @@ humanizeToggle.addEventListener("change", async () => {
     humanizeToggle.checked = savedHumanize;
   } finally {
     humanizeToggle.disabled = false;
+  }
+});
+
+/* 定时动作：0 分钟表示关闭定时。设置保存后下次启动会话生效。 */
+const scheduleMinutes = el("scheduleMinutes");
+const scheduleAction = el("scheduleAction");
+const saveSchedule = el("saveSchedule");
+invoke("get_schedule").then(v => {
+  scheduleMinutes.value = v.minutes;
+  scheduleAction.value = v.action;
+}).catch(() => {});
+saveSchedule.addEventListener("click", async () => {
+  const minutes = Number.parseInt(scheduleMinutes.value, 10);
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 10080) {
+    window.showOperationError("定时分钟数必须在 0..10080 之间");
+    return;
+  }
+  saveSchedule.disabled = true;
+  try {
+    await invoke("set_schedule", { minutes, action: scheduleAction.value });
+  } finally {
+    saveSchedule.disabled = false;
   }
 });
 

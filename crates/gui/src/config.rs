@@ -17,6 +17,10 @@ pub struct Settings {
     pub search_region: Option<Rect>,
     /// 拟人化节奏开关（扩展功能；见 fishing_core::humanize）
     pub humanize: bool,
+    pub schedule_minutes: u32,
+    pub schedule_action: String,
+    pub macro_keys: [Option<i32>; 2],
+    pub macro_interval_minutes: u32,
 }
 
 impl Default for Settings {
@@ -26,6 +30,10 @@ impl Default for Settings {
             strike_value: 7,
             search_region: None,
             humanize: true,
+            schedule_minutes: 0,
+            schedule_action: "stop_fishing".into(),
+            macro_keys: [Some(53), Some(54)],
+            macro_interval_minutes: 10,
         }
     }
 }
@@ -36,11 +44,37 @@ impl Settings {
             return Err("抛竿键无效".into());
         }
         validate_strike(self.strike_value)?;
+        validate_macro(self.macro_keys, self.macro_interval_minutes)?;
         if let Some(region) = self.search_region {
             validate_region(region)?;
         }
+        if self.schedule_minutes > 7 * 24 * 60 {
+            return Err("定时分钟数必须在 0..10080 之间".into());
+        }
+        if !matches!(
+            self.schedule_action.as_str(),
+            "stop_fishing" | "close_wow" | "shutdown"
+        ) {
+            return Err("定时动作无效".into());
+        }
         Ok(())
     }
+}
+
+pub fn validate_macro(keys: [Option<i32>; 2], minutes: u32) -> Result<(), String> {
+    if !(1..=10080).contains(&minutes) {
+        return Err("宏键周期必须为 1..10080 分钟的整数".into());
+    }
+    for code in keys.into_iter().flatten() {
+        if code == 0
+            || Key::from_console_key_value(code)
+                .and_then(Key::console_key_name)
+                .is_none()
+        {
+            return Err("宏按键无效".into());
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_strike(value: i32) -> Result<(), String> {
@@ -175,6 +209,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn old_settings_keep_default_macros_and_macro_validation_is_strict() {
+        let old: Settings = serde_json::from_str(r#"{"cast_key":52,"humanize":false}"#).unwrap();
+        assert_eq!(old.macro_keys, [Some(53), Some(54)]);
+        assert_eq!(old.macro_interval_minutes, 10);
+        assert!(old.validate().is_ok());
+        for minutes in [0, 10081, u32::MAX] {
+            assert!(validate_macro([None, None], minutes).is_err());
+        }
+        for code in [-1, 0, 256, 65535] {
+            assert!(validate_macro([Some(code), None], 10).is_err());
+        }
+        assert!(validate_macro([None, Some(112)], 1).is_ok());
+        assert!(validate_macro([None, None], 10080).is_ok());
+        let mut changed = old;
+        changed.macro_keys = [Some(65), None];
+        changed.macro_interval_minutes = 3;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(restored.macro_keys, [Some(65), None]);
+        assert_eq!(restored.macro_interval_minutes, 3);
+    }
+
+    #[test]
     fn legacy_migration_runs_once_and_invalid_json_is_not_overwritten() {
         let directory = std::env::temp_dir().join(format!(
             "fishing-migrate-{}-{}",
@@ -231,6 +288,17 @@ mod tests {
         ));
         let store = ConfigStore::load(&directory, &directory).unwrap();
         store.update(|s| s.strike_value = 23).unwrap();
+        store
+            .update(|s| {
+                s.macro_keys = [None, Some(112)];
+                s.macro_interval_minutes = 2;
+            })
+            .unwrap();
+        let restored = ConfigStore::load(&directory, &directory).unwrap().get();
+        assert_eq!(restored.macro_keys, [None, Some(112)]);
+        assert_eq!(restored.macro_interval_minutes, 2);
+        assert!(store.update(|s| s.macro_interval_minutes = 0).is_err());
+        assert_eq!(store.get().macro_interval_minutes, 2);
         assert_eq!(
             ConfigStore::load(&directory, &directory)
                 .unwrap()

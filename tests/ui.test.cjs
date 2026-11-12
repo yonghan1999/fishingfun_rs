@@ -6,6 +6,78 @@ const path = require("node:path");
 
 const ui = path.join(__dirname, "../crates/gui/ui");
 
+function macroUi(invoke) {
+  const elements = new Map();
+  const errors = [];
+  const context = vm.createContext({
+    window: {
+      invokeWithFeedback: invoke,
+      showOperationError: error => errors.push(error),
+      __TAURI__: { event: { listen() {} } },
+      addEventListener() {},
+    },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { value: "", handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; } });
+        return elements.get(id);
+      },
+      querySelectorAll() { return []; },
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(ui, "app.js"), "utf8"), context);
+  return { el: id => elements.get(id), errors };
+}
+
+test("周期宏捕获按键、清空、保存及失败重试，严格拒绝无效分钟数", async () => {
+  const saves = [];
+  let rejectSave;
+  let fail = true;
+  const { el, errors } = macroUi(async (command, args) => {
+    if (command === "get_macro_settings") return { keys: [53, 54], labels: ["D5", "D6"], minutes: 10 };
+    if (command === "set_macro_settings") {
+      saves.push(JSON.parse(JSON.stringify(args)));
+      if (fail) return new Promise((_, reject) => { rejectSave = reject; });
+      return { ...args, labels: ["F1", "未设置"] };
+    }
+  });
+  assert.equal(el("macroPanel").disabled, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(el("macroPanel").disabled, false);
+  assert.equal(el("macroKey1").value, "D5");
+  assert.equal(el("macroMinutes").value, 10);
+  let prevented = false;
+  el("macroKey1").handlers.keydown({ key: "F1", code: "F1", keyCode: 112, preventDefault() { prevented = true; } });
+  assert(prevented);
+  el("clearMacroKey2").handlers.click();
+  assert.equal(el("macroKey2").value, "未设置");
+  for (const invalid of ["", "0", "1.5", "10081", "abc"]) {
+    el("macroMinutes").value = invalid;
+    await el("saveMacro").handlers.click();
+  }
+  assert.equal(errors.length, 5);
+  assert.equal(saves.length, 0);
+  el("macroMinutes").value = "3";
+  const saving = el("saveMacro").handlers.click();
+  assert.equal(el("macroPanel").disabled, true);
+  rejectSave(new Error("disk full"));
+  await saving;
+  assert.equal(el("macroPanel").disabled, false);
+  assert.match(el("macroSaveStatus").textContent, /保存失败/);
+  assert.equal(el("macroKey1").value, "F1");
+  fail = false;
+  await el("saveMacro").handlers.click();
+  assert.deepEqual(saves, [{ keys: [112, null], minutes: 3 }, { keys: [112, null], minutes: 3 }]);
+  assert.match(el("macroSaveStatus").textContent, /已保存，下次启动生效/);
+});
+
+test("周期宏读取失败保持禁用，避免覆盖未知配置", async () => {
+  const { el } = macroUi(async command => {
+    if (command === "get_macro_settings") throw new Error("invalid config");
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(el("macroPanel").disabled, true);
+});
+
 test("图表阈值更新和清图保持当前会话阈值，纵轴能显示大阈值", () => {
   const lines = [];
   const ctx = new Proxy({}, { get: (_, name) => (...args) => {
