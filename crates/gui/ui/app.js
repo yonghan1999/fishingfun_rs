@@ -51,6 +51,17 @@ function applyStatus(status) {
   setButtonStates(status.phase === "Idle");
   if (status.phase === "Stopping") el("btnStop").disabled = true;
   if (chart) chart.setStrikeValue(status.strike_value);
+  const startupStatus = el("startupStatus");
+  startupStatus.hidden = status.phase !== "Starting" && status.phase !== "Stopping";
+  if (status.phase === "Starting") {
+    startupStatus.textContent = status.foreground_wait_secs != null
+      ? `等待魔兽世界进入前台，请切回游戏。剩余 ${status.foreground_wait_secs} 秒，可点击停止取消。`
+      : "正在启动钓鱼，请保持魔兽世界在前台。可点击停止取消。";
+  } else if (status.phase === "Stopping") {
+    startupStatus.textContent = "正在停止，请稍候……";
+  } else {
+    startupStatus.textContent = "";
+  }
 }
 
 async function syncStatus() { applyStatus(await invoke("bot_status")); }

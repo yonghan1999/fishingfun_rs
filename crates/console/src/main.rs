@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     .with_humanizer(humanizer_cfg);
 
     // C#: WowProcess.PressKey(ConsoleKey.Spacebar); Thread.Sleep(1500);
-    tracing::info!("请在十秒内切回游戏窗口。");
+    tracing::info!("请在六十秒内切回游戏窗口。");
     target.wait_foreground(&bot.stop_handle())?;
     let mut keys = WowKeySender::new(target);
     keys.press_key_cancellable(Key::SPACEBAR, &bot.stop_handle())?;

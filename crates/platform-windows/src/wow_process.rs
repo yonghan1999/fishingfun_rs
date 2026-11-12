@@ -41,6 +41,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 对应 C# WowProcess.LootDelay 静态字段（GUI 颜色配置窗口可实时改）。
 pub static LOOT_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
 
+pub const FOREGROUND_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// 请求 Windows 在当前用户权限下关机。
 pub fn shutdown_system() -> Result<(), String> {
     std::process::Command::new("shutdown")
@@ -164,7 +167,7 @@ fn main_window_of_process(pid: u32) -> Option<HWND> {
     state.hwnd
 }
 
-/// 前台窗口进程的主窗口（对应 C# GetActiveProcess().MainWindowHandle）。
+/// 当前前台窗口，不查询线程或控件的键盘焦点。
 fn active_window() -> Option<HWND> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -228,12 +231,17 @@ impl WowTarget {
         Ok(())
     }
 
+    /// 确认前台窗口属于本次绑定的游戏进程，不要求与枚举到的主窗口句柄相同。
     pub fn check_foreground(self) -> InputResult {
         self.validate()?;
-        if active_window() != Some(self.hwnd()) {
-            return Err(InputError::NotForeground);
-        }
-        Ok(())
+        let foreground_pid = active_window().and_then(|window| {
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(window, Some(&mut pid));
+            }
+            (pid != 0).then_some(pid)
+        });
+        check_foreground_process(self.pid, foreground_pid)
     }
 
     /// 结束本次会话绑定的 WoW 进程。
@@ -248,22 +256,23 @@ impl WowTarget {
         Ok(())
     }
 
-    /// 开始按钮会使 GUI 获得焦点，最多等待十秒让用户切回目标窗口。
+    /// 点击开始时 GUI 位于前台，最多等待六十秒，每 100ms 检查一次。
     pub fn wait_foreground(self, cancel: &CancellationToken) -> InputResult {
-        let start = std::time::Instant::now();
-        loop {
-            if cancel.is_cancelled() {
-                return Err(InputError::Cancelled);
-            }
-            match self.check_foreground() {
-                Ok(()) => return Ok(()),
-                Err(InputError::NotForeground) if start.elapsed() < Duration::from_secs(10) => {}
-                Err(error) => return Err(error),
-            }
-            if !cancel.wait(Duration::from_millis(25)) {
-                return Err(InputError::Cancelled);
-            }
-        }
+        self.wait_foreground_with_progress(cancel, |_| {})
+    }
+
+    /// 每个剩余秒数只通知一次，供界面显示启动等待进度。
+    pub fn wait_foreground_with_progress(
+        self,
+        cancel: &CancellationToken,
+        progress: impl FnMut(u64),
+    ) -> InputResult {
+        wait_for_foreground(
+            cancel,
+            FOREGROUND_WAIT_TIMEOUT,
+            || self.check_foreground(),
+            progress,
+        )
     }
 
     fn check_point(self, point: Point) -> InputResult {
@@ -280,6 +289,47 @@ impl WowTarget {
             return Err(InputError::OutsideTarget);
         }
         Ok(())
+    }
+}
+
+fn check_foreground_process(target_pid: u32, foreground_pid: Option<u32>) -> InputResult {
+    if foreground_pid == Some(target_pid) {
+        Ok(())
+    } else {
+        Err(InputError::NotForeground)
+    }
+}
+
+/// 检测可注入，启动等待测试无需切换真实窗口或发送输入。
+fn wait_for_foreground(
+    cancel: &CancellationToken,
+    timeout: Duration,
+    mut check: impl FnMut() -> InputResult,
+    mut progress: impl FnMut(u64),
+) -> InputResult {
+    let start = std::time::Instant::now();
+    let mut last_remaining = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(InputError::Cancelled);
+        }
+        match check() {
+            Ok(()) => return Ok(()),
+            Err(InputError::NotForeground) => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(InputError::NotForeground);
+        }
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        if last_remaining != Some(seconds) {
+            progress(seconds);
+            last_remaining = Some(seconds);
+        }
+        if !cancel.wait(FOREGROUND_POLL_INTERVAL.min(remaining)) {
+            return Err(InputError::Cancelled);
+        }
     }
 }
 
@@ -536,6 +586,90 @@ impl MouseController for WowMouseController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_check_accepts_bound_process_and_rejects_others() {
+        assert_eq!(check_foreground_process(42, Some(42)), Ok(()));
+        assert_eq!(
+            check_foreground_process(42, Some(43)),
+            Err(InputError::NotForeground)
+        );
+        assert_eq!(
+            check_foreground_process(42, None),
+            Err(InputError::NotForeground)
+        );
+    }
+
+    #[test]
+    fn startup_wait_allows_switching_back_to_game() {
+        let mut checks = 0;
+        let mut checked_at = Vec::new();
+        let mut progress = Vec::new();
+        let result = wait_for_foreground(
+            &CancellationToken::default(),
+            Duration::from_secs(1),
+            || {
+                checks += 1;
+                checked_at.push(std::time::Instant::now());
+                check_foreground_process(42, Some(if checks < 3 { 99 } else { 42 }))
+            },
+            |seconds| progress.push(seconds),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(checks, 3);
+        assert!(checked_at
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(100)));
+        assert_eq!(progress, vec![1]);
+    }
+
+    #[test]
+    fn startup_progress_reports_remaining_time_and_cancellation_interrupts_wait() {
+        let cancel = CancellationToken::default();
+        let result = wait_for_foreground(
+            &cancel,
+            FOREGROUND_WAIT_TIMEOUT,
+            || Err(InputError::NotForeground),
+            |seconds| {
+                assert_eq!(seconds, 60);
+                cancel.cancel();
+            },
+        );
+        assert_eq!(result, Err(InputError::Cancelled));
+    }
+
+    #[test]
+    fn startup_wait_handles_timeout_cancellation_and_missing_target() {
+        let cancel = CancellationToken::default();
+        assert_eq!(
+            wait_for_foreground(
+                &cancel,
+                Duration::ZERO,
+                || Err(InputError::NotForeground),
+                |_| {}
+            ),
+            Err(InputError::NotForeground)
+        );
+        assert_eq!(
+            wait_for_foreground(
+                &cancel,
+                Duration::from_secs(1),
+                || Err(InputError::TargetUnavailable),
+                |_| {}
+            ),
+            Err(InputError::TargetUnavailable)
+        );
+        cancel.cancel();
+        assert_eq!(
+            wait_for_foreground(
+                &cancel,
+                Duration::from_secs(1),
+                || panic!("取消后不应继续查询窗口"),
+                |_| {}
+            ),
+            Err(InputError::Cancelled)
+        );
+    }
+
     #[test]
     fn invalid_target_rejects_input_without_injection() {
         let target = WowTarget { pid: 0, window: 0 };

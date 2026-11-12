@@ -119,6 +119,18 @@ html, body {
 }
 #humanizeToggle { cursor: pointer; }
 
+#startupStatus {
+  width: calc(100% - 20px);
+  margin: 0 8px 8px 10px;
+  padding: 8px;
+  border: 1px solid #c5a75a;
+  border-radius: 4px;
+  background: #fff8df;
+  color: #614800;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 #macroPanel {
   width: calc(100% - 20px);
   min-width: 0;

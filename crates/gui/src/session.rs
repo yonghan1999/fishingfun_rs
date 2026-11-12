@@ -25,6 +25,7 @@ pub struct Session {
     pub cast_key: Arc<Mutex<Key>>,
     pub strike: i32,
     phase: Mutex<Phase>,
+    pub foreground_wait_secs: Mutex<Option<u64>>,
     finished: (Mutex<bool>, Condvar),
 }
 
@@ -42,6 +43,7 @@ impl Sessions {
             cast_key: Arc::new(Mutex::new(key)),
             strike,
             phase: Mutex::new(Phase::Starting),
+            foreground_wait_secs: Mutex::new(None),
             finished: (Mutex::new(false), Condvar::new()),
         });
         *current = Some(session.clone());

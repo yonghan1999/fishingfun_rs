@@ -126,11 +126,12 @@ test("日志条目有上限，启动失败恢复按钮，图表使用后端实�
   const listeners = {};
   let domReady;
   let threshold;
+  let botStatus = { phase: "Idle", strike_value: 23, foreground_wait_secs: null };
   const context = vm.createContext({
     window: {
       invokeWithFeedback: async command => {
         if (command === "start_bot") throw new Error("spawn failed");
-        if (command === "bot_status") return { phase: "Idle", strike_value: 23 };
+        if (command === "bot_status") return botStatus;
         if (command === "get_cast_key") return "4";
         if (command === "get_humanize") return true;
       },
@@ -153,6 +154,28 @@ test("日志条目有上限，启动失败恢复按钮，图表使用后端实�
   await assert.rejects(elements.get("btnPlay").handlers.click(), /spawn failed/);
   assert.equal(elements.get("btnPlay").disabled, false);
   assert.equal(elements.get("btnStop").disabled, true);
+  botStatus = { ...botStatus, phase: "Starting", foreground_wait_secs: 60 };
+  await listeners["bot-status"]();
+  assert.equal(elements.get("startupStatus").hidden, false);
+  assert.match(elements.get("startupStatus").textContent, /等待魔兽世界进入前台.*60 秒.*停止取消/);
+  assert.equal(elements.get("btnStop").disabled, false);
+  botStatus.foreground_wait_secs = 59;
+  await listeners["bot-status"]();
+  assert.match(elements.get("startupStatus").textContent, /59 秒/);
+  botStatus.foreground_wait_secs = null;
+  await listeners["bot-status"]();
+  assert.match(elements.get("startupStatus").textContent, /正在启动钓鱼/);
+  botStatus.phase = "Running";
+  await listeners["bot-status"]();
+  assert.equal(elements.get("startupStatus").hidden, true);
+  botStatus.phase = "Stopping";
+  await listeners["bot-status"]();
+  assert.match(elements.get("startupStatus").textContent, /正在停止/);
+  assert.equal(elements.get("btnStop").disabled, true);
+  botStatus.phase = "Idle";
+  await listeners["bot-status"]();
+  assert.equal(elements.get("startupStatus").hidden, true);
+  assert.equal(elements.get("startupStatus").textContent, "");
 });
 
 test("拟人化保存失败恢复已保存状态，保存期间禁用，后台错误可见", async () => {

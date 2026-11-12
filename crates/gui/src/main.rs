@@ -173,6 +173,7 @@ fn encode_frame(ev: FrameEvent, mode: ClassifierMode) -> Option<FramePayload> {
 struct BotStatus {
     phase: Phase,
     strike_value: i32,
+    foreground_wait_secs: Option<u64>,
 }
 
 fn status(state: &AppState) -> BotStatus {
@@ -180,10 +181,15 @@ fn status(state: &AppState) -> BotStatus {
         Some(session) => BotStatus {
             phase: session.phase(),
             strike_value: session.strike,
+            foreground_wait_secs: *session
+                .foreground_wait_secs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
         },
         None => BotStatus {
             phase: Phase::Idle,
             strike_value: state.config.get().strike_value,
+            foreground_wait_secs: None,
         },
     }
 }
@@ -231,12 +237,33 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 if session.cancel.is_cancelled() {
                     return;
                 }
-                tracing::info!("请在十秒内切回游戏窗口。");
+                tracing::info!("请在六十秒内切回游戏窗口，等待期间可点击停止取消。");
                 let mut keys = WowKeySender::new(target);
-                if let Err(error) = target
-                    .wait_foreground(&session.cancel)
-                    .and_then(|_| keys.press_key_cancellable(Key::SPACEBAR, &session.cancel))
-                {
+                let foreground_result =
+                    target.wait_foreground_with_progress(&session.cancel, |remaining| {
+                        *session
+                            .foreground_wait_secs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(remaining);
+                        let _ = app2.emit("bot-status", ());
+                    });
+                *session
+                    .foreground_wait_secs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = app2.emit("bot-status", ());
+                if let Err(error) = foreground_result {
+                    if error != InputError::Cancelled {
+                        let message = if error == InputError::NotForeground {
+                            "等待游戏窗口进入前台超过 60 秒，本次启动已取消，请重新开始".to_string()
+                        } else {
+                            error.to_string()
+                        };
+                        let _ = app2.emit("bot-error", message);
+                    }
+                    return;
+                }
+                if let Err(error) = keys.press_key_cancellable(Key::SPACEBAR, &session.cancel) {
                     if error != InputError::Cancelled {
                         let _ = app2.emit("bot-error", error.to_string());
                     }

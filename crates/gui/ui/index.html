@@ -24,7 +24,7 @@
 
     <!-- 右上：工具按钮卡 -->
     <div class="card" id="toolbarCard">
-      <button id="btnPlay" class="tool-btn" title="开始后请在十秒内切回游戏窗口">
+      <button id="btnPlay" class="tool-btn" title="开始后请在 60 秒内切回游戏窗口，等待期间可停止">
         <img id="playImg" src="assets/play.png" alt="Start" />
         <img id="playImgDisabled" src="assets/play_disabled.png" alt="" class="hidden" />
       </button>
@@ -44,6 +44,7 @@
         <input type="checkbox" id="humanizeToggle" checked />
         <span>拟人化</span>
       </label>
+      <p id="startupStatus" role="status" aria-live="polite" hidden></p>
       <fieldset id="macroPanel" disabled>
         <legend>周期宏（下次启动生效）</legend>
         <div class="macro-row">
