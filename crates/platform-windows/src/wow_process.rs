@@ -200,6 +200,7 @@ impl WowKeySender {
 pub struct WowTarget {
     pid: u32,
     window: isize,
+    capture_bounds: Option<fishing_core::Rect>,
 }
 
 impl WowTarget {
@@ -208,16 +209,17 @@ impl WowTarget {
         let target = Self {
             pid: wow.pid,
             window: wow.main_window.0 as isize,
+            capture_bounds: None,
         };
         target.validate()?;
         Ok(target)
     }
 
-    fn hwnd(self) -> HWND {
+    pub(crate) fn hwnd(self) -> HWND {
         HWND(self.window as *mut _)
     }
 
-    fn validate(self) -> InputResult {
+    pub(crate) fn validate(self) -> InputResult {
         let mut pid = 0;
         unsafe {
             if !IsWindow(self.hwnd()).as_bool() {
@@ -231,9 +233,24 @@ impl WowTarget {
         Ok(())
     }
 
+    pub fn pid(self) -> u32 {
+        self.pid
+    }
+
+    pub fn with_capture_bounds(mut self, bounds: fishing_core::Rect) -> Self {
+        self.capture_bounds = Some(bounds);
+        self
+    }
+
     /// 确认前台窗口属于本次绑定的游戏进程，不要求与枚举到的主窗口句柄相同。
     pub fn check_foreground(self) -> InputResult {
         self.validate()?;
+        if self
+            .capture_bounds
+            .is_some_and(|expected| crate::screen::client_bounds(self).ok() != Some(expected))
+        {
+            return Err(InputError::TargetGeometryChanged);
+        }
         let foreground_pid = active_window().and_then(|window| {
             let mut pid = 0;
             unsafe {
@@ -250,8 +267,9 @@ impl WowTarget {
         unsafe {
             let process = OpenProcess(PROCESS_TERMINATE, false, self.pid)
                 .map_err(|_| InputError::TargetUnavailable)?;
-            TerminateProcess(process, 0).map_err(|_| InputError::Rejected)?;
+            let result = TerminateProcess(process, 0).map_err(|_| InputError::Rejected);
             let _ = windows::Win32::Foundation::CloseHandle(process);
+            result?;
         }
         Ok(())
     }
@@ -672,7 +690,11 @@ mod tests {
 
     #[test]
     fn invalid_target_rejects_input_without_injection() {
-        let target = WowTarget { pid: 0, window: 0 };
+        let target = WowTarget {
+            pid: 0,
+            window: 0,
+            capture_bounds: None,
+        };
         assert_eq!(
             target.check_foreground(),
             Err(InputError::TargetUnavailable)
@@ -688,7 +710,11 @@ mod tests {
     }
     #[test]
     fn cancelled_mouse_operation_never_injects_input() {
-        let target = WowTarget { pid: 0, window: 0 };
+        let target = WowTarget {
+            pid: 0,
+            window: 0,
+            capture_bounds: None,
+        };
         let cancel = CancellationToken::default();
         cancel.cancel();
         let mut mouse = WowMouseController::new(target);

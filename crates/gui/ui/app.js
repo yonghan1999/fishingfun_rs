@@ -49,6 +49,7 @@ function setButtonStates(playEnabled) {
 /* bot 线程退出（对应 C# BotThread 末尾 SetButtonStates(true)） */
 function applyStatus(status) {
   setButtonStates(status.phase === "Idle");
+  if (recoveryBlocked) el("btnPlay").disabled = true;
   if (status.phase === "Stopping") el("btnStop").disabled = true;
   if (chart) chart.setStrikeValue(status.strike_value);
   const startupStatus = el("startupStatus");
@@ -262,8 +263,8 @@ invoke("get_schedule").then(v => {
   scheduleAction.value = v.action;
 }).catch(() => {});
 saveSchedule.addEventListener("click", async () => {
-  const minutes = Number.parseInt(scheduleMinutes.value, 10);
-  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 10080) {
+  const minutes = Number(scheduleMinutes.value);
+  if (!String(scheduleMinutes.value).trim() || !Number.isInteger(minutes) || minutes < 0 || minutes > 10080) {
     window.showOperationError("定时分钟数必须在 0..10080 之间");
     return;
   }
@@ -275,6 +276,90 @@ saveSchedule.addEventListener("click", async () => {
   }
 });
 
+/* 设置恢复和诊断独立于识别帧，空闲时仍保留最后一次会话快照。 */
+let recoveryBlocked = false;
+let diagnosticsBusy = false;
+async function refreshDiagnostics() {
+  if (diagnosticsBusy) return;
+  diagnosticsBusy = true;
+  try {
+    const d = await invoke("get_diagnostics");
+    if (!d) return;
+    const remaining = d.remaining_secs == null ? "" : ` · 定时剩余 ${Math.ceil(d.remaining_secs / 60)} 分钟`;
+    el("runtimeStatus").textContent = `状态：${d.activity || "空闲"}${remaining}`;
+    el("diagnosticsText").textContent = [
+      `目标 PID：${d.target_pid ?? "未绑定"}`,
+      d.client ? `客户区：${d.client.width}×${d.client.height}，原点 (${d.client.x}, ${d.client.y})` : "客户区：未捕获",
+      `截图：${d.captures} 帧，失败 ${d.capture_errors} 次，最近耗时 ${Number(d.capture_ms).toFixed(1)} ms`,
+      `连续未识别：${d.consecutive_misses} 帧`,
+      `最近错误：${d.last_error || "无"}`,
+    ].join("\n");
+  } catch { /* 错误由统一 IPC 提示显示。 */ }
+  finally { diagnosticsBusy = false; }
+}
+
+async function refreshRecovery() {
+  const error = await invoke("get_settings_recovery");
+  recoveryBlocked = !!error;
+  el("recoveryWarning").textContent = error ? `配置无法加载：${error}。原文件未覆盖，请导入备份或恢复默认值。` : "";
+  if (error) {
+    el("diagnosticsPanel").open = true;
+    el("btnPlay").disabled = true;
+  }
+}
+
+function downloadJson(text, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+el("exportSettings").addEventListener("click", async () => {
+  downloadJson(await invoke("export_settings"), "settings-backup.json");
+});
+el("exportDiagnostics").addEventListener("click", async () => {
+  downloadJson(await invoke("export_diagnostics"), "diagnostics.json");
+});
+el("importSettings").addEventListener("click", () => el("settingsFile").click());
+async function restoreSettings(text) {
+  const buttons = [el("importSettings"), el("resetSettings")];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    el("settingsResult").textContent = await invoke("restore_settings", { text });
+    await reloadSettings();
+  } catch { /* 失败时保留当前配置及错误提示。 */ }
+  finally { buttons.forEach(button => { button.disabled = false; }); }
+}
+el("settingsFile").addEventListener("change", async () => {
+  const file = el("settingsFile").files[0];
+  if (!file) return;
+  try {
+    if (file.size > 64 * 1024) { window.showOperationError("配置文件超过 64KiB"); return; }
+    await restoreSettings(await file.text());
+  } finally { el("settingsFile").value = ""; }
+});
+el("resetSettings").addEventListener("click", () => restoreSettings(null));
+
+async function reloadSettings() {
+  const [key, macros, humanize, schedule] = await Promise.all([
+    invoke("get_cast_key"), invoke("get_macro_settings"), invoke("get_humanize"), invoke("get_schedule"),
+  ]);
+  castKeyInput.value = key;
+  showMacroSettings(macros);
+  savedHumanize = !!humanize;
+  humanizeToggle.checked = savedHumanize;
+  scheduleMinutes.value = schedule.minutes;
+  scheduleAction.value = schedule.action;
+  await refreshRecovery();
+  await syncStatus();
+}
+listen("settings-restored", () => reloadSettings().catch(() => {}));
+
 /* ---------------- 初始化 ---------------- */
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -283,4 +368,7 @@ window.addEventListener("DOMContentLoaded", () => {
   // C# SizeChanged 防抖后 flipper 最终停在正面 —— 初始即正面，无需动作
   setButtonStates(true);
   syncStatus();
+  refreshRecovery().catch(() => {});
+  refreshDiagnostics();
+  setInterval(refreshDiagnostics, 1000);
 });

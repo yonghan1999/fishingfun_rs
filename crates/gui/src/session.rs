@@ -99,11 +99,33 @@ impl Session {
     pub fn phase(&self) -> Phase {
         *self.phase.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// 和手动停止共享状态锁，停止先到达时不能再执行定时外部动作。
+    pub fn scheduled_action<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        if *phase == Phase::Running {
+            Some(action())
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_stop_suppresses_scheduled_action() {
+        let sessions = Sessions::default();
+        let session = sessions.reserve(Key::D4, 7).unwrap();
+        assert!(session.scheduled_action(|| true).is_none());
+        assert!(session.run());
+        assert_eq!(session.scheduled_action(|| 42), Some(42));
+        session.stop();
+        assert!(session
+            .scheduled_action(|| panic!("停止后不能执行定时动作"))
+            .is_none());
+    }
     #[test]
     fn shutdown_waits_for_finish_and_can_time_out_without_finishing() {
         let sessions = Arc::new(Sessions::default());

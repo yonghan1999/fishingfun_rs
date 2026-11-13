@@ -78,6 +78,142 @@ test("周期宏读取失败保持禁用，避免覆盖未知配置", async () =>
   assert.equal(el("macroPanel").disabled, true);
 });
 
+test("定时分钟数严格拒绝小数、空值和越界，恢复失败保留现有设置", async () => {
+  const saved = [];
+  const restored = [];
+  const { el, errors } = macroUi(async (command, args) => {
+    if (command === "get_macro_settings") return { keys: [53, 54], labels: ["D5", "D6"], minutes: 10 };
+    if (command === "get_schedule") return { minutes: 0, action: "stop_fishing" };
+    if (command === "set_schedule") saved.push(args);
+    if (command === "restore_settings") { restored.push(args); throw new Error("backup failed"); }
+  });
+  await new Promise(setImmediate);
+  for (const value of ["", " ", "1.5", "1abc", "-1", "10081"]) {
+    el("scheduleMinutes").value = value;
+    await el("saveSchedule").handlers.click();
+  }
+  assert.equal(saved.length, 0);
+  assert.equal(errors.length, 6);
+  el("scheduleMinutes").value = "2";
+  await el("saveSchedule").handlers.click();
+  assert.equal(saved[0].minutes, 2);
+  await el("resetSettings").handlers.click();
+  assert.equal(restored[0].text, null);
+  assert.equal(el("scheduleMinutes").value, "2");
+  assert.equal(el("resetSettings").disabled, false);
+});
+
+test("诊断显示计数与剩余时间，损坏配置阻止启动，恢复后同步全部设置", async () => {
+  const elements = new Map(), listeners = {};
+  let ready, poll;
+  let recovery = "JSON 损坏";
+  const context = vm.createContext({
+    window: {
+      invokeWithFeedback: async command => {
+        if (command === "get_settings_recovery") return recovery;
+        if (command === "get_macro_settings") return { keys: [112, null], labels: ["F1", "未设置"], minutes: 3 };
+        if (command === "get_humanize") return false;
+        if (command === "get_cast_key") return "A";
+        if (command === "get_schedule") return { minutes: 20, action: "stop_fishing" };
+        if (command === "bot_status") return { phase: "Idle", strike_value: 7 };
+        if (command === "get_diagnostics") return { activity: "已锁定，等待咬钩", target_pid: 42, client: { width: 1920, height: 1080, x: -1920, y: 0 }, captures: 50, capture_errors: 1, capture_ms: 2.5, consecutive_misses: 3, remaining_secs: 61, last_error: "测试错误" };
+      },
+      __TAURI__: { event: { listen(name, fn) { listeners[name] = fn; } } },
+      addEventListener(_, fn) { ready = fn; },
+    },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { value: "", handlers: {}, classList: { toggle() {}, add() {}, remove() {} }, addEventListener(name, fn) { this.handlers[name] = fn; } });
+        return elements.get(id);
+      }, querySelectorAll() { return []; },
+    },
+    AmplitudeChart: class { setStrikeValue() {} }, FlyingFish: class {},
+    setInterval(fn) { poll = fn; }, setTimeout() {}, clearTimeout() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(ui, "app.js"), "utf8"), context);
+  ready();
+  await new Promise(setImmediate);
+  assert.equal(elements.get("btnPlay").disabled, true);
+  assert.equal(elements.get("diagnosticsPanel").open, true);
+  assert.match(elements.get("runtimeStatus").textContent, /已锁定.*2 分钟/);
+  assert.match(elements.get("diagnosticsText").textContent, /-1920.*\n截图：50 帧，失败 1 次/);
+  recovery = null;
+  await listeners["settings-restored"]();
+  await poll();
+  assert.equal(elements.get("btnPlay").disabled, false);
+  assert.equal(elements.get("castKeyInput").value, "A");
+  assert.equal(elements.get("macroKey1").value, "F1");
+  assert.equal(elements.get("scheduleMinutes").value, 20);
+  assert.equal(elements.get("humanizeToggle").checked, false);
+});
+
+test("设置与诊断导出调用对应后端并生成本机 JSON 下载", async () => {
+  const downloads = [], blobs = [], listeners = {};
+  const elements = new Map();
+  const context = vm.createContext({
+    window: {
+      invokeWithFeedback: async command => {
+        if (command === "export_settings") return '{"loot_delay_ms":350}';
+        if (command === "export_diagnostics") return '{"version":"0.1.0"}';
+      }, __TAURI__: { event: { listen(name, fn) { listeners[name] = fn; } } }, addEventListener() {},
+    },
+    document: {
+      getElementById(id) { if (!elements.has(id)) elements.set(id, { handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; } }); return elements.get(id); },
+      querySelectorAll() { return []; }, body: { appendChild() {} },
+      createElement() { return { click() { downloads.push({ name: this.download, href: this.href }); }, remove() {} }; },
+    },
+    Blob: class { constructor(parts) { blobs.push(parts.join("")); } },
+    URL: { createObjectURL() { return "blob:local"; }, revokeObjectURL() {} }, setTimeout(fn) { fn(); },
+  });
+  vm.runInContext(fs.readFileSync(path.join(ui, "app.js"), "utf8"), context);
+  await elements.get("exportSettings").handlers.click();
+  await elements.get("exportDiagnostics").handlers.click();
+  assert.deepEqual(downloads.map(d => d.name), ["settings-backup.json", "diagnostics.json"]);
+  assert.deepEqual(blobs, ['{"loot_delay_ms":350}', '{"version":"0.1.0"}']);
+});
+
+test("颜色和延迟在拖动结束才保存，失败回读，恢复事件清除旧截图并同步模式", async () => {
+  const elements = new Map(), listeners = {}, calls = [];
+  let config = { colour_multiplier: 0.5, colour_closeness_multiplier: 2, mode: "Red" };
+  const ctx2d = { createImageData() { return { data: new Uint8ClampedArray(256 * 256 * 4) }; }, putImageData() {} };
+  const context = vm.createContext({
+    window: {
+      invokeWithFeedback: async (command, args) => {
+        calls.push({ command, args });
+        if (command === "get_classifier_config") return config;
+        if (command === "get_loot_delay") return 250;
+        if (command === "get_strike_value") return 7;
+        if (command === "set_classifier_params" || command === "set_loot_delay") throw new Error("disk full");
+      }, __TAURI__: { event: { listen(name, fn) { listeners[name] = fn; } } },
+    },
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { value: "100", style: {}, handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; }, getContext() { return ctx2d; } });
+        return elements.get(id);
+      },
+    },
+  });
+  vm.runInContext(fs.readFileSync(path.join(ui, "colour.js"), "utf8"), context);
+  await new Promise(setImmediate);
+  const multiplier = elements.get("colourMultiplier");
+  multiplier.value = "125";
+  await multiplier.handlers.input();
+  assert.equal(calls.filter(c => c.command === "set_classifier_params").length, 0);
+  await multiplier.handlers.change();
+  assert.equal(calls.find(c => c.command === "set_classifier_params").args.colourMultiplier, 1.25);
+  assert.equal(multiplier.value, 50);
+  elements.get("lootDelay").value = "900";
+  await elements.get("lootDelay").handlers.change();
+  assert.equal(elements.get("lootDelay").value, 250);
+  config = { colour_multiplier: 1, colour_closeness_multiplier: 1, mode: "Blue" };
+  listeners["settings-restored"]();
+  await new Promise(setImmediate);
+  assert.equal(elements.get("cmbColors").value, "Blue");
+  assert.equal(elements.get("colourMultiplier").value, 100);
+  assert.equal(elements.get("wowCanvas").style.display, "none");
+  assert.equal(elements.get("wowPlaceholder").style.display, "block");
+});
+
 test("图表阈值更新和清图保持当前会话阈值，纵轴能显示大阈值", () => {
   const lines = [];
   const ctx = new Proxy({}, { get: (_, name) => (...args) => {
@@ -143,7 +279,7 @@ test("日志条目有上限，启动失败恢复按钮，图表使用后端实�
       querySelectorAll() { return []; }, createElement: element,
     },
     AmplitudeChart: class { setStrikeValue(value) { threshold = value; } },
-    FlyingFish: class { stop() {} }, setTimeout() {}, clearTimeout() {},
+    FlyingFish: class { stop() {} }, setTimeout() {}, clearTimeout() {}, setInterval() {},
   });
   vm.runInContext(fs.readFileSync(path.join(ui, "app.js"), "utf8"), context);
   domReady();

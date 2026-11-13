@@ -125,7 +125,7 @@ function normRect(a, b) {
 }
 
 /* 单击取色：从原始截图读像素，按 R>B 自动切换红/蓝模式，再设置色值滑条 */
-function pickColour(pt) {
+async function pickColour(pt) {
   if (!rawCanvas) return;
   const d = rawCanvas.getContext("2d").getImageData(pt.x, pt.y, 1, 1).data;
   const [r, g, b] = d;
@@ -133,11 +133,12 @@ function pickColour(pt) {
   // 自动判断模式：红点选红模式，蓝点选蓝模式（仍可手动改下拉框）
   const newMode = r > b ? "Red" : "Blue";
   if (newMode !== mode) {
+    try { await invoke("set_classifier_mode", { mode: newMode }); }
+    catch { await loadSettings(); return; }
     mode = newMode;
     el("cmbColors").value = mode;
     if (mode === "Red") { primaryColor = "红色"; secondaryColor = "蓝色"; }
     else { primaryColor = "蓝色"; secondaryColor = "红色"; }
-    invoke("set_classifier_mode", { mode });
     updateColourText();
   }
 
@@ -178,12 +179,13 @@ el("wowCanvas").addEventListener("mouseup", async e => {
   const cur = toBitmap(e);
   if (Math.abs(cur.x - start.x) < DRAG_THRESHOLD &&
       Math.abs(cur.y - start.y) < DRAG_THRESHOLD) {
-    pickColour(start); // 单击 = 取色
+    await pickColour(start); // 单击 = 取色
     return;
   }
   const r = normRect(start, cur);
   if (r.w <= 0 || r.h <= 0) { blit(); return; }
-  await invoke("set_search_region", { x: r.x, y: r.y, width: r.w, height: r.h });
+  await invoke("set_search_region", { x: r.x, y: r.y, width: r.w, height: r.h,
+    sourceWidth: screenImg.naturalWidth, sourceHeight: screenImg.naturalHeight });
   region = r;
   updateRegionInfo();
   blit();
@@ -209,7 +211,7 @@ el("findColour").addEventListener("input", () => {
 });
 el("findColour").addEventListener("change", () => renderCube(true));
 
-/* 乘数滑条：C# TwoWay 绑定 → 拖动中实时写参数 + 更新文字，拖完才重渲染 */
+/* 乘数滑条：拖动预览说明，结束后统一保存并渲染，避免逐像素拖动写盘。 */
 function updateColourText() {
   el("labelColourMultiplier").textContent =
     `${primaryColor} × ${colourMultiplier} 必须大于绿色和${secondaryColor}`;
@@ -218,25 +220,25 @@ function updateColourText() {
   el("colourLabel").textContent = primaryColor + ":";
 }
 
-el("colourMultiplier").addEventListener("input", async () => {
+el("colourMultiplier").addEventListener("input", () => {
   colourMultiplier = parseInt(el("colourMultiplier").value, 10) / 100;
   updateColourText();
-  await pushParams();
 });
-el("colourMultiplier").addEventListener("change", () => renderCube(true));
+el("colourMultiplier").addEventListener("change", async () => { await pushParams(); renderCube(true); });
 
-el("colourClosenessMultiplier").addEventListener("input", async () => {
+el("colourClosenessMultiplier").addEventListener("input", () => {
   closenessMultiplier = parseInt(el("colourClosenessMultiplier").value, 10) / 100;
   updateColourText();
-  await pushParams();
 });
-el("colourClosenessMultiplier").addEventListener("change", () => renderCube(true));
+el("colourClosenessMultiplier").addEventListener("change", async () => { await pushParams(); renderCube(true); });
 
 async function pushParams() {
-  await invoke("set_classifier_params", {
-    colourMultiplier,
-    colourClosenessMultiplier: closenessMultiplier,
-  });
+  try {
+    await invoke("set_classifier_params", {
+      colourMultiplier,
+      colourClosenessMultiplier: closenessMultiplier,
+    });
+  } catch { await loadSettings(); }
 }
 
 /* 拖动只更新说明，结束后写盘；实际阈值在下次开始时生效。 */
@@ -244,13 +246,17 @@ el("strikeValue").addEventListener("input", () => {
   const v = parseInt(el("strikeValue").value, 10);
   el("labelStrike").textContent = `下次启动：浮漂下沉 ${v} 像素时提竿（海水起伏大时调大）`;
 });
-el("strikeValue").addEventListener("change", () => invoke("set_strike_value", {
-  v: parseInt(el("strikeValue").value, 10),
-}));
+el("strikeValue").addEventListener("change", async () => {
+  try { await invoke("set_strike_value", { v: parseInt(el("strikeValue").value, 10) }); }
+  catch { await loadSettings(); }
+});
 
 /* Capture Screen：重新截屏并全量渲染 */
 el("btnCapture").addEventListener("click", async () => {
   const b64 = await invoke("capture_screen");
+  const saved = await invoke("get_search_region");
+  region = saved ? { x: saved.x, y: saved.y, w: saved.width, h: saved.height } : null;
+  updateRegionInfo();
   screenImg = new Image();
   screenImg.onload = () => {
     el("wowPlaceholder").style.display = "none";
@@ -270,24 +276,27 @@ el("cmbColors").addEventListener("change", async () => {
   mode = el("cmbColors").value;
   if (mode === "Red") { primaryColor = "红色"; secondaryColor = "蓝色"; }
   else { primaryColor = "蓝色"; secondaryColor = "红色"; }
-  await invoke("set_classifier_mode", { mode });
+  try { await invoke("set_classifier_mode", { mode }); }
+  catch { await loadSettings(); return; }
   updateColourText();
   renderCube(true);
 });
 
-/* 拾取延迟滑条：实时写全局（C# LootDelay_ValueChanged） */
-el("lootDelay").addEventListener("input", () => {
-  invoke("set_loot_delay", { ms: parseInt(el("lootDelay").value, 10) });
+/* 拖动结束后保存，写盘失败恢复后端的已保存值。 */
+el("lootDelay").addEventListener("change", async () => {
+  try { await invoke("set_loot_delay", { ms: parseInt(el("lootDelay").value, 10) }); }
+  catch { await loadSettings(); }
 });
 
 /* ---------------- 初始化 ---------------- */
 
-(async () => {
+async function loadSettings() {
   const cfg = await invoke("get_classifier_config");
   colourMultiplier = cfg.colour_multiplier;
   closenessMultiplier = cfg.colour_closeness_multiplier;
   mode = cfg.mode;
-  if (mode === "Blue") { primaryColor = "蓝色"; secondaryColor = "红色"; }
+  primaryColor = mode === "Blue" ? "蓝色" : "红色";
+  secondaryColor = mode === "Blue" ? "红色" : "蓝色";
   el("colourMultiplier").value = Math.round(colourMultiplier * 100);
   el("colourClosenessMultiplier").value = Math.round(closenessMultiplier * 100);
   el("cmbColors").value = mode;
@@ -296,9 +305,16 @@ el("lootDelay").addEventListener("input", () => {
   el("labelStrike").textContent = `下次启动：浮漂下沉 ${el("strikeValue").value} 像素时提竿（海水起伏大时调大）`;
   // 恢复上次框选的水面搜索区域
   const saved = await invoke("get_search_region");
-  if (saved) region = { x: saved.x, y: saved.y, w: saved.width, h: saved.height };
+  region = saved ? { x: saved.x, y: saved.y, w: saved.width, h: saved.height } : null;
   updateRegionInfo();
   updateColourText();
   // C# 初始不自动渲染截图（占位图 quirk 保留），立方图渲染一次
   renderCube(false);
-})();
+}
+window.__TAURI__.event.listen("settings-restored", () => {
+  screenImg = rawCanvas = hlCanvas = null;
+  el("wowCanvas").style.display = "none";
+  el("wowPlaceholder").style.display = "block";
+  loadSettings().catch(() => {});
+});
+loadSettings().catch(() => {});

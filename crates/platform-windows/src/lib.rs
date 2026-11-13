@@ -3,7 +3,7 @@
 pub mod screen;
 pub mod wow_process;
 
-pub use screen::WowScreenCapture;
+pub use screen::{capture_client, client_bounds, WowScreenCapture};
 pub use wow_process::{
     find_wow_process, is_wow_classic, shutdown_system, WowKeySender, WowMouseController, WowTarget,
     FOREGROUND_WAIT_TIMEOUT, LOOT_DELAY_MS,

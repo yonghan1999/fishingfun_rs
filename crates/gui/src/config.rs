@@ -21,6 +21,13 @@ pub struct Settings {
     pub schedule_action: String,
     pub macro_keys: [Option<i32>; 2],
     pub macro_interval_minutes: u32,
+    pub classifier_mode: String,
+    pub colour_multiplier: f64,
+    pub colour_closeness_multiplier: f64,
+    pub loot_delay_ms: u64,
+    pub search_region_size: Option<[i32; 2]>,
+    #[serde(default)]
+    pub capture_version: u32,
 }
 
 impl Default for Settings {
@@ -34,12 +41,42 @@ impl Default for Settings {
             schedule_action: "stop_fishing".into(),
             macro_keys: [Some(53), Some(54)],
             macro_interval_minutes: 10,
+            classifier_mode: "Red".into(),
+            colour_multiplier: 0.5,
+            colour_closeness_multiplier: 2.0,
+            loot_delay_ms: 2000,
+            search_region_size: None,
+            capture_version: 1,
         }
     }
 }
 
 impl Settings {
     fn validate(&self) -> Result<(), String> {
+        validate_classifier(self.colour_multiplier, self.colour_closeness_multiplier)?;
+        if !matches!(self.classifier_mode.as_str(), "Red" | "Blue") || self.loot_delay_ms > 3500 {
+            return Err("颜色模式或拾取延迟无效".into());
+        }
+        if self.capture_version > 1 {
+            return Err("配置来自更新版本，请升级应用".into());
+        }
+        if self.capture_version == 1
+            && self.search_region.is_some()
+            && self.search_region_size.is_none()
+        {
+            return Err("搜索区域缺少原始客户区尺寸，请重新框选".into());
+        }
+        if let Some([w, h]) = self.search_region_size {
+            if w <= 1
+                || h <= 1
+                || self.search_region.is_some_and(|r| {
+                    i64::from(r.x) + i64::from(r.width) > i64::from(w)
+                        || i64::from(r.y) + i64::from(r.height) > i64::from(h)
+                })
+            {
+                return Err("搜索区域超出原始客户区".into());
+            }
+        }
         if Key::from_console_key_value(self.cast_key).is_none() {
             return Err("抛竿键无效".into());
         }
@@ -58,6 +95,55 @@ impl Settings {
             return Err("定时动作无效".into());
         }
         Ok(())
+    }
+}
+
+pub fn validate_classifier(colour: f64, closeness: f64) -> Result<(), String> {
+    if !colour.is_finite()
+        || !(0.0..=3.0).contains(&colour)
+        || !closeness.is_finite()
+        || !(0.0..=5.0).contains(&closeness)
+    {
+        return Err("颜色乘数必须在 0..3、接近度乘数必须在 0..5 之间".into());
+    }
+    Ok(())
+}
+
+impl Settings {
+    pub fn classifier(&self) -> fishing_core::classifier::PixelClassifier {
+        fishing_core::classifier::PixelClassifier {
+            mode: if self.classifier_mode == "Blue" {
+                fishing_core::classifier::ClassifierMode::Blue
+            } else {
+                fishing_core::classifier::ClassifierMode::Red
+            },
+            colour_multiplier: self.colour_multiplier,
+            colour_closeness_multiplier: self.colour_closeness_multiplier,
+        }
+    }
+
+    pub fn region_for(&self, width: i32, height: i32) -> Option<Rect> {
+        let r = self.search_region?;
+        let [w, h] = self.search_region_size?;
+        if width <= 1 || height <= 1 {
+            return None;
+        }
+        let x = ((i64::from(r.x) * i64::from(width) / i64::from(w)) as i32).min(width - 1);
+        let y = ((i64::from(r.y) * i64::from(height) / i64::from(h)) as i32).min(height - 1);
+        let right =
+            ((i64::from(r.x) + i64::from(r.width)) * i64::from(width) / i64::from(w)) as i32;
+        let bottom =
+            ((i64::from(r.y) + i64::from(r.height)) * i64::from(height) / i64::from(h)) as i32;
+        Some(Rect::new(x, y, (right - x).max(1), (bottom - y).max(1)))
+    }
+
+    fn migrate(&mut self) {
+        if self.capture_version == 0 {
+            // 旧区域属于主屏中央截图，不能直接用于客户区。
+            self.search_region = None;
+            self.search_region_size = None;
+            self.capture_version = 1;
+        }
     }
 }
 
@@ -97,6 +183,7 @@ pub fn validate_region(rect: Rect) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_region(text: &str) -> Option<Rect> {
     let values: Vec<i32> = text
         .trim()
@@ -115,6 +202,7 @@ fn parse_region(text: &str) -> Option<Rect> {
 pub struct ConfigStore {
     path: PathBuf,
     settings: Mutex<Settings>,
+    recovery: Mutex<Option<String>>,
 }
 
 impl ConfigStore {
@@ -122,9 +210,10 @@ impl ConfigStore {
         let path = directory.join("settings.json");
         let settings = match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let settings: Settings = serde_json::from_str(&text)
+                let mut settings: Settings = serde_json::from_str(&text)
                     .map_err(|e| format!("配置文件 {} 无效：{e}", path.display()))?;
                 settings.validate()?;
+                settings.migrate();
                 settings
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -143,9 +232,7 @@ impl ConfigStore {
                 {
                     settings.strike_value = strike;
                 }
-                settings.search_region = std::fs::read_to_string(legacy.join("searchregion.txt"))
-                    .ok()
-                    .and_then(|s| parse_region(&s));
+                // 旧主屏位图区域无法安全迁移为客户区坐标，保留旧文件供参考。
                 write_atomic(&path, &settings)?;
                 settings
             }
@@ -154,7 +241,67 @@ impl ConfigStore {
         Ok(Self {
             path,
             settings: Mutex::new(settings),
+            recovery: Mutex::new(None),
         })
+    }
+
+    /// 配置损坏时保持原文件不动，允许用户通过界面导入或恢复。
+    pub fn load_or_recover(directory: &Path, legacy: &Path) -> Result<Self, String> {
+        match Self::load(directory, legacy) {
+            Ok(store) => Ok(store),
+            Err(error) if directory.join("settings.json").is_file() => Ok(Self {
+                path: directory.join("settings.json"),
+                settings: Mutex::new(Settings::default()),
+                recovery: Mutex::new(Some(error)),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn recovery_error(&self) -> Option<String> {
+        self.recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn replace(&self, text: Option<&str>) -> Result<PathBuf, String> {
+        let mut next = match text {
+            Some(text) => {
+                if text.len() > 64 * 1024 {
+                    return Err("配置文件超过 64KiB".into());
+                }
+                serde_json::from_str::<Settings>(text).map_err(|e| format!("配置无效：{e}"))?
+            }
+            None => Settings::default(),
+        };
+        next.validate()?;
+        next.migrate();
+        let mut current = self.settings.lock().map_err(|e| e.to_string())?;
+        let backup = self.path.with_file_name(format!(
+            "settings-backup-{}-{}-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        // 备份失败就不覆盖，损坏文件也原样保留。
+        use std::io::Write;
+        let bytes = std::fs::read(&self.path).map_err(|e| e.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        write_atomic(&self.path, &next)?;
+        *current = next;
+        *self.recovery.lock().map_err(|e| e.to_string())? = None;
+        Ok(backup)
     }
 
     pub fn get(&self) -> Settings {
@@ -166,6 +313,9 @@ impl ConfigStore {
 
     pub fn update(&self, change: impl FnOnce(&mut Settings)) -> Result<(), String> {
         let mut current = self.settings.lock().map_err(|e| e.to_string())?;
+        if self.recovery_error().is_some() {
+            return Err("配置损坏，请先在设置恢复中导入配置或恢复默认值".into());
+        }
         let mut next = current.clone();
         change(&mut next);
         next.validate()?;
@@ -207,6 +357,87 @@ fn write_atomic(path: &Path, settings: &Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colour_delay_and_relative_region_survive_restart_and_restore() {
+        let directory = std::env::temp_dir().join(format!(
+            "settings-roundtrip-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = ConfigStore::load(&directory, &directory).unwrap();
+        store
+            .update(|s| {
+                s.classifier_mode = "Blue".into();
+                s.colour_multiplier = 1.25;
+                s.colour_closeness_multiplier = 1.5;
+                s.loot_delay_ms = 350;
+                s.search_region = Some(Rect::new(100, 50, 200, 100));
+                s.search_region_size = Some([1000, 500]);
+            })
+            .unwrap();
+        let restored = ConfigStore::load(&directory, &directory).unwrap();
+        let settings = restored.get();
+        assert_eq!(
+            settings.classifier().mode,
+            fishing_core::classifier::ClassifierMode::Blue
+        );
+        assert_eq!(settings.loot_delay_ms, 350);
+        assert_eq!(settings.colour_multiplier, 1.25);
+        assert_eq!(
+            settings.region_for(2000, 1000),
+            Some(Rect::new(200, 100, 400, 200))
+        );
+        let exported = serde_json::to_string(&settings).unwrap();
+        let original = std::fs::read_to_string(&store.path).unwrap();
+        let backup = restored.replace(None).unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        assert_eq!(restored.get().loot_delay_ms, 2000);
+        restored.replace(Some(&exported)).unwrap();
+        assert_eq!(restored.get().loot_delay_ms, 350);
+        for invalid in [
+            r#"{"colour_multiplier":9}"#,
+            r#"{"loot_delay_ms":3501}"#,
+            r#"{"classifier_mode":"Green"}"#,
+        ] {
+            assert!(restored.replace(Some(invalid)).is_err());
+            assert_eq!(restored.get().loot_delay_ms, 350);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_settings_recovery_preserves_original_until_explicit_restore() {
+        let directory = std::env::temp_dir().join(format!(
+            "settings-recovery-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("settings.json"), "broken").unwrap();
+        let store = ConfigStore::load_or_recover(&directory, &directory).unwrap();
+        assert!(store.recovery_error().is_some());
+        assert!(store.update(|s| s.loot_delay_ms = 0).is_err());
+        assert!(store.replace(Some("invalid")).is_err());
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), "broken");
+        let backup = store.replace(None).unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "broken");
+        assert!(store.recovery_error().is_none());
+        assert!(ConfigStore::load(&directory, &directory).is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_screen_region_is_cleared_and_tiny_scaled_region_stays_inside() {
+        let mut old: Settings =
+            serde_json::from_str(r#"{"search_region":{"x":10,"y":10,"width":20,"height":20}}"#)
+                .unwrap();
+        old.migrate();
+        assert_eq!(old.search_region, None);
+        old.search_region = Some(Rect::new(999, 499, 1, 1));
+        old.search_region_size = Some([1000, 500]);
+        assert_eq!(old.region_for(2, 2), Some(Rect::new(1, 1, 1, 1)));
+    }
 
     #[test]
     fn old_settings_keep_default_macros_and_macro_validation_is_strict() {
@@ -319,6 +550,7 @@ mod tests {
                 .open(&store.path)
                 .unwrap();
             assert!(store.update(|s| s.strike_value = 24).is_err());
+            assert!(store.replace(None).is_err());
             assert_eq!(store.get().strike_value, 23);
             drop(locked);
         }

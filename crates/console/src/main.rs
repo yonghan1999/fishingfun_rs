@@ -15,7 +15,7 @@ use fishing_core::fish_bot::FishingBot;
 use fishing_core::traits::Key;
 use fishing_core::traits::KeySender;
 use fishing_platform_windows::{
-    is_wow_classic, WowKeySender, WowMouseController, WowScreenCapture, WowTarget,
+    client_bounds, is_wow_classic, WowKeySender, WowMouseController, WowScreenCapture, WowTarget,
 };
 
 /// FishingFun console（对应 C# Console 版；原发布名为 powershell.exe 属伪装 quirk）。
@@ -53,6 +53,21 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let target = WowTarget::find()?;
+    // 先验证参数，再等待前台；窗口几何在切回游戏后确定。
+    let cast_key = parse_key(&args.cast_key)?;
+    let ten_min_keys = args
+        .ten_min_keys
+        .iter()
+        .map(|s| parse_key(s))
+        .collect::<Result<Vec<_>>>()?;
+    let cancel = fishing_core::cancellation::CancellationToken::default();
+    tracing::info!("请在六十秒内切回游戏窗口。");
+    target.wait_foreground(&cancel)?;
+    let bounds = client_bounds(target)?;
+    let target = target.with_capture_bounds(bounds);
+    let mut keys = WowKeySender::new(target);
+    keys.press_key_cancellable(Key::SPACEBAR, &cancel)?;
+    thread::sleep(Duration::from_millis(1500));
 
     let mut pixel_classifier = PixelClassifier::new();
     if args.blue {
@@ -62,15 +77,11 @@ fn main() -> Result<()> {
 
     pixel_classifier.set_configuration(is_wow_classic());
 
-    let bobber_finder = SearchBobberFinder::new(pixel_classifier, WowScreenCapture::new());
+    let bobber_finder = SearchBobberFinder::new(
+        pixel_classifier,
+        WowScreenCapture::for_target(target, bounds, cancel.clone()),
+    );
     let bite_watcher = PositionBiteWatcher::new(args.strike_value);
-
-    let cast_key = parse_key(&args.cast_key)?;
-    let ten_min_keys = args
-        .ten_min_keys
-        .iter()
-        .map(|s| parse_key(s))
-        .collect::<Result<Vec<_>>>()?;
 
     let (tx, rx) = channel();
     // C#: bot.FishingEventHandler += (b, e) => LogManager.GetLogger("Fishbot").Info(e)
@@ -97,14 +108,8 @@ fn main() -> Result<()> {
         ten_min_keys,
         tx,
     )
-    .with_humanizer(humanizer_cfg);
-
-    // C#: WowProcess.PressKey(ConsoleKey.Spacebar); Thread.Sleep(1500);
-    tracing::info!("请在六十秒内切回游戏窗口。");
-    target.wait_foreground(&bot.stop_handle())?;
-    let mut keys = WowKeySender::new(target);
-    keys.press_key_cancellable(Key::SPACEBAR, &bot.stop_handle())?;
-    thread::sleep(Duration::from_millis(1500));
+    .with_humanizer(humanizer_cfg)
+    .with_session(cancel, std::sync::Arc::new(std::sync::Mutex::new(cast_key)));
 
     bot.start();
 

@@ -67,6 +67,21 @@
         </select>
         <button id="saveSchedule" type="button">保存</button>
       </div>
+      <div id="runtimeStatus" role="status" aria-live="polite">状态：空闲</div>
+      <details id="diagnosticsPanel">
+        <summary>设置恢复与诊断</summary>
+        <p id="recoveryWarning" role="alert"></p>
+        <p>导入或恢复前请先停止钓鱼。原配置会自动备份。</p>
+        <div class="settings-actions">
+          <button id="exportSettings" type="button">导出设置</button>
+          <button id="importSettings" type="button">导入设置</button>
+          <button id="resetSettings" type="button">恢复默认值</button>
+          <button id="exportDiagnostics" type="button">导出诊断</button>
+          <input id="settingsFile" type="file" accept=".json,application/json" hidden />
+        </div>
+        <p id="settingsResult" role="status"></p>
+        <pre id="diagnosticsText"></pre>
+      </details>
     </div>
 
     <!-- 右下：图表 Flipper + 日志 Flipper -->

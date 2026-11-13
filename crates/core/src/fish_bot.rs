@@ -31,6 +31,8 @@ use crate::traits::{
 };
 use crate::Point;
 
+type ActivityReporter = Box<dyn Fn(&str)>;
+
 /// 对应 C# FishingBot。
 pub struct FishingBot {
     bobber_finder: Box<dyn BobberFinder>,
@@ -48,6 +50,7 @@ pub struct FishingBot {
     /// 拟人化节奏（扩展功能；默认关闭，保持 C# 保真节拍）
     humanizer: Humanizer,
     last_error: Option<InputError>,
+    activity: Option<ActivityReporter>,
 }
 
 impl FishingBot {
@@ -73,6 +76,7 @@ impl FishingBot {
             start_time: Instant::now(),
             humanizer: Humanizer::disabled(),
             last_error: None,
+            activity: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl FishingBot {
 
             // 拟人化：周期性休息（取消可中断休息）
             if let Some(rest) = self.humanizer.break_due() {
+                self.report_activity("休息中");
                 tracing::info!("S02 {}", rest.as_secs());
                 if !self.cancel.wait(rest) {
                     break;
@@ -122,6 +127,7 @@ impl FishingBot {
                 break;
             }
             self.emit(FishingEvent::new(FishingAction::Cast));
+            self.report_activity("抛竿后观察");
 
             if !self.is_enabled() {
                 break;
@@ -132,6 +138,7 @@ impl FishingBot {
 
             // 拟人化：每轮之间的随机停顿（取消可中断）
             let pause = self.humanizer.between_casts_delay();
+            self.report_activity("等待下一轮抛竿");
             if !pause.is_zero() && !self.cancel.wait(pause) {
                 break;
             }
@@ -185,6 +192,17 @@ impl FishingBot {
         self
     }
 
+    pub fn with_activity(mut self, report: impl Fn(&str) + 'static) -> Self {
+        self.activity = Some(Box::new(report));
+        self
+    }
+
+    fn report_activity(&self, activity: &str) {
+        if let Some(report) = &self.activity {
+            report(activity);
+        }
+    }
+
     fn is_enabled(&self) -> bool {
         !self.cancel.is_cancelled()
     }
@@ -228,12 +246,14 @@ impl FishingBot {
         }
         self.bobber_finder.reset();
 
+        self.report_activity("寻找浮漂");
         let bobber_position = match self.find_bobber() {
             Some(p) => p,
             None => return,
         };
 
         self.bite_watcher.reset(bobber_position);
+        self.report_activity("已锁定，等待咬钩");
 
         tracing::info!("S07 {}", bobber_position);
 
@@ -258,6 +278,7 @@ impl FishingBot {
             if self.bite_watcher.is_bite(current) {
                 // 拟人化：人的反应需要时间，延迟期间取消则放弃本次拾取
                 let delay = self.humanizer.reaction_delay();
+                self.report_activity("检测到咬钩，准备拾取");
                 if !delay.is_zero() && !self.cancel.wait(delay) {
                     return;
                 }
@@ -287,6 +308,7 @@ impl FishingBot {
             return;
         }
         self.start_time = Instant::now();
+        self.report_activity("执行周期宏");
         self.humanizer.resample_ten_min();
 
         if self.ten_min_key.is_empty() {
@@ -310,6 +332,7 @@ impl FishingBot {
     }
 
     fn loot(&mut self, bobber_position: Point) {
+        self.report_activity("拾取中");
         tracing::info!("S11");
         let result = self
             .mouse
@@ -354,6 +377,29 @@ mod tests {
     use crate::events::FishingAction;
     use std::sync::mpsc::channel;
     use std::sync::Mutex;
+
+    #[test]
+    fn activity_reports_lock_reaction_and_loot_in_order() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let report = seen.clone();
+        let (bot, _, clicks) = recorded_bot(Box::new(ScriptedFinder::new(
+            vec![],
+            Some(Point::new(10, 20)),
+        )));
+        let mut bot =
+            bot.with_activity(move |activity| report.lock().unwrap().push(activity.into()));
+        bot.wait_for_bite();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "寻找浮漂",
+                "已锁定，等待咬钩",
+                "检测到咬钩，准备拾取",
+                "拾取中"
+            ]
+        );
+        assert_eq!(clicks.lock().unwrap().len(), 1);
+    }
 
     type Recorded<T> = Arc<Mutex<Vec<T>>>;
 

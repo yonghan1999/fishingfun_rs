@@ -3,18 +3,89 @@
 //! 高度减 100 是原版有意行为，保留。
 //! C# Graphics.CopyFromScreen 底层即 GDI BitBlt，此处直接调用等价 API。
 
+use crate::wow_process::WowTarget;
 use fishing_core::traits::{CapturedFrame, ScreenCapture};
 use fishing_core::{Point, Rect};
 use image::RgbImage;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
     HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
+    GetClientRect, GetSystemMetrics, GetWindowRect, IsIconic, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+
+/// 客户区几何始终使用物理屏幕坐标，允许副屏的负原点。
+pub fn client_bounds(target: WowTarget) -> anyhow::Result<Rect> {
+    target.validate()?;
+    unsafe {
+        anyhow::ensure!(!IsIconic(target.hwnd()).as_bool(), "游戏窗口已最小化");
+        let mut rc = RECT::default();
+        GetClientRect(target.hwnd(), &mut rc)?;
+        let mut origin = POINT::default();
+        anyhow::ensure!(
+            ClientToScreen(target.hwnd(), &mut origin).as_bool(),
+            "无法取得客户区坐标"
+        );
+        let bounds = Rect::new(origin.x, origin.y, rc.right, rc.bottom);
+        anyhow::ensure!(bounds.width > 1 && bounds.height > 1, "游戏客户区为空");
+        let desktop = Rect::new(
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        );
+        anyhow::ensure!(
+            contained(bounds, desktop),
+            "游戏客户区为空或超出桌面，请完整显示游戏窗口"
+        );
+        Ok(bounds)
+    }
+}
+
+fn contained(rect: Rect, limit: Rect) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && rect.x >= limit.x
+        && rect.y >= limit.y
+        && i64::from(rect.x) + i64::from(rect.width) <= i64::from(limit.x) + i64::from(limit.width)
+        && i64::from(rect.y) + i64::from(rect.height)
+            <= i64::from(limit.y) + i64::from(limit.height)
+}
+
+/// 绑定会话目标；不允许截图期间窗口变化后继续使用旧坐标。
+pub fn capture_client(
+    target: WowTarget,
+    expected: Option<Rect>,
+    region: Option<Rect>,
+) -> anyhow::Result<CapturedFrame> {
+    let bounds = client_bounds(target)?;
+    anyhow::ensure!(
+        expected.is_none_or(|old| old == bounds),
+        "游戏窗口位置或大小已改变，请重新开始"
+    );
+    let local = region.unwrap_or(Rect::new(0, 0, bounds.width, bounds.height));
+    anyhow::ensure!(
+        contained(local, Rect::new(0, 0, bounds.width, bounds.height)),
+        "搜索区域超出游戏客户区，请重新框选"
+    );
+    let origin = Point::new(bounds.x + local.x, bounds.y + local.y);
+    let image = unsafe {
+        let dc = ScreenDc(GetDC(HWND::default()));
+        anyhow::ensure!(!dc.0.is_invalid(), "GetDC 失败");
+        capture_region(dc.0, origin.x, origin.y, local.width, local.height)?
+    };
+    anyhow::ensure!(
+        client_bounds(target)? == bounds,
+        "截图期间游戏窗口发生变化，请重新开始"
+    );
+    Ok(CapturedFrame { image, origin })
+}
 
 // 作用域守卫覆盖所有提前返回路径。
 struct ScreenDc(HDC);
@@ -63,12 +134,45 @@ fn primary_screen_size() -> (i32, i32) {
 /// 注意 DPI：与 WinForms 版一致，进程需声明 system DPI aware，
 /// 否则 GetSystemMetrics 返回缩放后的逻辑像素（见仓库 docs/development.md，
 /// manifest 在 console/gui 打包时配置）。
-#[derive(Debug, Default)]
-pub struct WowScreenCapture;
+#[derive(Default)]
+pub struct WowScreenCapture {
+    target: Option<(
+        WowTarget,
+        Rect,
+        fishing_core::cancellation::CancellationToken,
+    )>,
+}
 
 impl WowScreenCapture {
     pub fn new() -> Self {
-        WowScreenCapture
+        Self::default()
+    }
+
+    pub fn for_target(
+        target: WowTarget,
+        bounds: Rect,
+        cancel: fishing_core::cancellation::CancellationToken,
+    ) -> Self {
+        Self {
+            target: Some((target, bounds, cancel)),
+        }
+    }
+
+    fn take(&self, region: Option<Rect>) -> CapturedFrame {
+        let result = match &self.target {
+            Some((target, bounds, cancel)) => {
+                let result = capture_client(*target, Some(*bounds), region);
+                if result.is_err() {
+                    cancel.cancel();
+                }
+                result
+            }
+            None => match region {
+                Some(region) => Self::try_capture_region(region),
+                None => Self::try_capture(),
+            },
+        };
+        Self::capture_or_fallback(result)
     }
 
     /// 截取主屏中央区域，返回 (宽 W/2, 高 H/2−100)，原点 (W/4, H/4)。
@@ -204,11 +308,11 @@ unsafe fn capture_region(
 
 impl ScreenCapture for WowScreenCapture {
     fn capture(&mut self) -> CapturedFrame {
-        Self::capture_or_fallback(Self::try_capture())
+        self.take(None)
     }
 
     fn capture_region(&mut self, region: Rect) -> CapturedFrame {
-        Self::capture_or_fallback(Self::try_capture_region(region))
+        self.take(Some(region))
     }
 }
 
@@ -225,6 +329,20 @@ pub(crate) fn window_rect(hwnd: HWND) -> Option<RECT> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_region_accepts_negative_monitor_origin_and_rejects_overflow() {
+        use super::*;
+        let desktop = Rect::new(-1920, 0, 3840, 1080);
+        assert!(contained(Rect::new(-1900, 10, 1800, 1000), desktop));
+        assert!(!contained(Rect::new(-1921, 10, 1800, 1000), desktop));
+        assert!(!contained(Rect::new(1900, 0, 100, 100), desktop));
+        assert!(!contained(Rect::new(0, 0, 0, 100), desktop));
+        assert!(!contained(
+            Rect::new(i32::MAX - 1, 0, 100, 100),
+            Rect::new(0, 0, i32::MAX, 1000)
+        ));
+    }
+
     #[test]
     #[ignore = "需要真实 Windows 桌面会话；覆盖成功和 BitBlt 错误路径的 GDI 回收"]
     fn capture_releases_gdi_on_success_and_failure() {

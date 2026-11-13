@@ -25,15 +25,18 @@ use fishing_core::tracking_finder::TrackingBobberFinder;
 use fishing_core::traits::{InputError, Key, KeySender};
 use fishing_core::{Point, Rect};
 use fishing_platform_windows::{
-    shutdown_system, WowKeySender, WowMouseController, WowScreenCapture, WowTarget, LOOT_DELAY_MS,
+    capture_client, client_bounds, shutdown_system, WowKeySender, WowMouseController, WowTarget,
+    LOOT_DELAY_MS,
 };
 use image::{ImageFormat, Rgb, RgbImage};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 mod config;
+mod diagnostics;
 mod session;
 use config::ConfigStore;
+use diagnostics::{ClientCapture, Diagnostics, FileLog, ObservedFinder};
 use session::{Phase, ScheduledAction, Sessions};
 
 struct AppState {
@@ -44,6 +47,10 @@ struct AppState {
     bot: Sessions,
     config: ConfigStore,
     closing: AtomicBool,
+    diagnostics: Arc<Diagnostics>,
+    file_log: std::sync::Mutex<FileLog>,
+    settings_change: std::sync::Mutex<()>,
+    target: std::sync::Mutex<Option<WowTarget>>,
 }
 
 // ---------------------------------------------------------------- 日志桥接
@@ -201,6 +208,10 @@ fn bot_status(state: State<AppState>) -> BotStatus {
 
 #[tauri::command]
 fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
+    if let Some(error) = state.config.recovery_error() {
+        return Err(error);
+    }
     if state.closing.load(Ordering::Acquire) {
         return Err("应用正在退出".into());
     }
@@ -208,6 +219,7 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let config = state.config.get();
     let key = Key::from_console_key_value(config.cast_key).ok_or("抛竿键无效")?;
     let session = state.bot.reserve(key, config.strike_value)?;
+    *state.target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
     let config_humanize = config.humanize;
     let macro_keys = config
         .macro_keys
@@ -226,12 +238,26 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let search_region = state.search_region.clone();
     let app2 = app.clone();
     let worker_session = session.clone();
+    let diagnostics = state.diagnostics.clone();
+    *diagnostics
+        .snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = diagnostics::Snapshot {
+        activity: "等待游戏进入前台".into(),
+        target_pid: Some(target.pid()),
+        ..Default::default()
+    };
+    *diagnostics
+        .deadline
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     let spawned = std::thread::Builder::new()
         .name("fishing-session".into())
         .spawn(move || {
             let session = worker_session;
             let mut frame_thread = None;
             let mut event_thread = None;
+            let mut timer_thread = None;
             // 即使线程 panic，仍取消桥接线程并清理本次会话。
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if session.cancel.is_cancelled() {
@@ -259,12 +285,14 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                         } else {
                             error.to_string()
                         };
+                        diagnostics.error(message.clone());
                         let _ = app2.emit("bot-error", message);
                     }
                     return;
                 }
                 if let Err(error) = keys.press_key_cancellable(Key::SPACEBAR, &session.cancel) {
                     if error != InputError::Cancelled {
+                        diagnostics.error(error.to_string());
                         let _ = app2.emit("bot-error", error.to_string());
                     }
                     return;
@@ -274,28 +302,37 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 }
                 let _ = app2.emit("bot-status", ());
 
+                let bounds = match client_bounds(target) {
+                    Ok(bounds) => bounds,
+                    Err(error) => {
+                        diagnostics.error(error.to_string());
+                        let _ = app2.emit("bot-error", error.to_string());
+                        return;
+                    }
+                };
+                diagnostics
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .client = Some(bounds);
+                let target = target.with_capture_bounds(bounds);
+                *search_region.write().unwrap_or_else(|e| e.into_inner()) =
+                    config.region_for(bounds.width, bounds.height);
                 if schedule_minutes > 0 {
                     let timer_cancel = session.cancel.clone();
-                    let timer_target = target;
-                    std::thread::spawn(move || {
-                        if timer_cancel.wait(Duration::from_secs(u64::from(schedule_minutes) * 60))
-                        {
+                    let duration = Duration::from_secs(u64::from(schedule_minutes) * 60);
+                    *diagnostics
+                        .deadline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some(std::time::Instant::now() + duration);
+                    timer_thread = Some(std::thread::spawn(move || {
+                        let due = timer_cancel.wait(duration);
+                        if due {
                             timer_cancel.cancel();
-                            match schedule_action {
-                                ScheduledAction::StopFishing => {}
-                                ScheduledAction::CloseWow => {
-                                    if let Err(error) = timer_target.terminate() {
-                                        tracing::error!("定时关闭魔兽世界失败: {error}");
-                                    }
-                                }
-                                ScheduledAction::Shutdown => {
-                                    if let Err(error) = shutdown_system() {
-                                        tracing::error!("定时关机失败: {error}");
-                                    }
-                                }
-                            }
                         }
-                    });
+                        due
+                    }));
                 }
 
                 let (frame_tx, frame_rx) = fishing_core::latest::channel::<FrameEvent>();
@@ -333,7 +370,12 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 let mut finder = TrackingBobberFinder::new_shared(
                     classifier,
                     search_region,
-                    WowScreenCapture::new(),
+                    ClientCapture {
+                        target,
+                        bounds,
+                        diagnostics: diagnostics.clone(),
+                        cancel: session.cancel.clone(),
+                    },
                 );
                 finder.set_frame_handler(frame_tx);
                 let mut humanize_cfg = if config_humanize {
@@ -343,7 +385,10 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 };
                 humanize_cfg.macro_interval_secs = macro_interval_secs;
                 let mut bot = FishingBot::new(
-                    Box::new(finder),
+                    Box::new(ObservedFinder {
+                        finder,
+                        diagnostics: diagnostics.clone(),
+                    }),
                     Box::new(PositionBiteWatcher::new(session.strike)),
                     Box::new(WowKeySender::new(target)),
                     Box::new(WowMouseController::new(target)),
@@ -352,15 +397,21 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                     ev_tx,
                 )
                 .with_session(session.cancel.clone(), session.cast_key.clone())
-                .with_humanizer(humanize_cfg);
+                .with_humanizer(humanize_cfg)
+                .with_activity({
+                    let diagnostics = diagnostics.clone();
+                    move |activity| diagnostics.activity(activity)
+                });
                 bot.start();
                 if let Some(error) = bot.last_error() {
+                    diagnostics.error(error.to_string());
                     let _ = app2.emit("bot-error", error.to_string());
                 }
                 session.cancel.cancel();
                 drop(bot);
             }));
             session.cancel.cancel();
+            let timer_due = timer_thread.is_some_and(|timer| timer.join().unwrap_or(false));
             // panic 展开同样会释放生产端；标记会话结束前必须回收桥接线程。
             for worker in [frame_thread, event_thread].into_iter().flatten() {
                 if worker.join().is_err() {
@@ -368,9 +419,30 @@ fn start_bot(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 }
             }
             if result.is_err() {
+                diagnostics.error("机器人异常退出".into());
                 tracing::error!("S90");
                 let _ = app2.emit("bot-error", "机器人异常退出，请查看日志");
             }
+            // 机器人及桥接线程已释放输入资源后才执行定时外部动作。
+            if timer_due && result.is_ok() && diagnostics.get().last_error.is_none() {
+                let action_result = session.scheduled_action(|| match schedule_action {
+                    ScheduledAction::StopFishing => Ok(()),
+                    ScheduledAction::CloseWow => target.terminate().map_err(|e| e.to_string()),
+                    ScheduledAction::Shutdown => shutdown_system(),
+                });
+                if let Some(Err(error)) = action_result {
+                    diagnostics.error(error.clone());
+                    let _ = app2.emit("bot-error", error);
+                }
+            }
+            if let Some(error) = diagnostics.get().last_error {
+                let _ = app2.emit("bot-error", error);
+            }
+            diagnostics.activity("已停止");
+            *diagnostics
+                .deadline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             if let Some(state) = app2.try_state::<AppState>() {
                 // 在会话锁仍占位时发送退出事件，防止新会话先启动后收到旧退出通知。
                 state.bot.finish_with(&session, || {
@@ -411,6 +483,7 @@ fn get_cast_key(state: State<AppState>) -> String {
 
 #[tauri::command]
 fn set_cast_key(code: i32, state: State<AppState>) -> Result<bool, String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     let Some(key) = Key::from_console_key_value(code) else {
         return Ok(false);
     };
@@ -452,6 +525,7 @@ fn set_macro_settings(
     minutes: u32,
     state: State<AppState>,
 ) -> Result<MacroSettings, String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     config::validate_macro(keys, minutes)?;
     state.config.update(|c| {
         c.macro_keys = keys;
@@ -484,14 +558,13 @@ fn set_classifier_params(
     colour_closeness_multiplier: f64,
     state: State<AppState>,
 ) -> Result<(), String> {
-    if !colour_multiplier.is_finite()
-        || !(0.0..=3.0).contains(&colour_multiplier)
-        || !colour_closeness_multiplier.is_finite()
-        || !(0.0..=5.0).contains(&colour_closeness_multiplier)
-    {
-        return Err("颜色乘数必须在 0..3、接近度乘数必须在 0..5 之间".into());
-    }
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
+    config::validate_classifier(colour_multiplier, colour_closeness_multiplier)?;
     let mut c = state.classifier.write().map_err(|e| e.to_string())?;
+    state.config.update(|settings| {
+        settings.colour_multiplier = colour_multiplier;
+        settings.colour_closeness_multiplier = colour_closeness_multiplier;
+    })?;
     c.colour_multiplier = colour_multiplier;
     c.colour_closeness_multiplier = colour_closeness_multiplier;
     Ok(())
@@ -499,12 +572,17 @@ fn set_classifier_params(
 
 #[tauri::command]
 fn set_classifier_mode(mode: String, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     let mut c = state.classifier.write().map_err(|e| e.to_string())?;
-    c.mode = match mode.as_str() {
+    let next = match mode.as_str() {
         "Blue" => ClassifierMode::Blue,
         "Red" => ClassifierMode::Red,
         _ => return Err("未知的羽毛颜色模式".into()),
     };
+    state
+        .config
+        .update(|settings| settings.classifier_mode = mode)?;
+    c.mode = next;
     Ok(())
 }
 
@@ -514,10 +592,14 @@ fn get_loot_delay() -> u64 {
 }
 
 #[tauri::command]
-fn set_loot_delay(ms: u64) -> Result<(), String> {
+fn set_loot_delay(ms: u64, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     if ms > 3500 {
         return Err("拾取延迟必须在 0..3500ms 之间".into());
     }
+    state
+        .config
+        .update(|settings| settings.loot_delay_ms = ms)?;
     LOOT_DELAY_MS.store(ms, Ordering::SeqCst);
     Ok(())
 }
@@ -535,6 +617,7 @@ fn get_humanize(state: State<AppState>) -> bool {
 
 #[tauri::command]
 fn set_humanize(on: bool, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     state.config.update(|c| c.humanize = on)?;
     tracing::info!("拟人化节奏: {}", if on { "开启" } else { "关闭" });
     Ok(())
@@ -557,6 +640,7 @@ fn get_schedule(state: State<AppState>) -> ScheduleSettings {
 
 #[tauri::command]
 fn set_schedule(minutes: u32, action: String, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     if minutes > 7 * 24 * 60 {
         return Err("定时分钟数必须在 0..10080 之间".into());
     }
@@ -571,6 +655,7 @@ fn set_schedule(minutes: u32, action: String, state: State<AppState>) -> Result<
 
 #[tauri::command]
 fn set_strike_value(v: i32, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     config::validate_strike(v)?;
     state.config.update(|c| c.strike_value = v)?;
     let _ = app.emit("bot-status", ());
@@ -579,8 +664,9 @@ fn set_strike_value(v: i32, app: AppHandle, state: State<AppState>) -> Result<()
 
 /// 颜色配置窗口 Capture Screen（对应 C# WowScreen.GetBitmap）。
 #[tauri::command]
-fn capture_screen() -> Result<String, String> {
-    let frame = WowScreenCapture::try_capture().map_err(|e| e.to_string())?;
+fn capture_screen(state: State<AppState>) -> Result<String, String> {
+    let target = selected_target(&state)?;
+    let frame = capture_client(target, None, None).map_err(|e| e.to_string())?;
     let mut buf = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(frame.image)
         .write_to(&mut buf, ImageFormat::Png)
@@ -590,9 +676,75 @@ fn capture_screen() -> Result<String, String> {
 
 // ---------------------------------------------------------------- 搜索区域（F3 扩展）
 
+fn selected_target(state: &AppState) -> Result<WowTarget, String> {
+    if state.bot.current().is_some() {
+        return state
+            .target
+            .lock()
+            .map_err(|e| e.to_string())?
+            .ok_or("目标窗口不可用".into());
+    }
+    WowTarget::find().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_diagnostics(state: State<AppState>) -> diagnostics::Snapshot {
+    state.diagnostics.get()
+}
+
+#[tauri::command]
+fn get_settings_recovery(state: State<AppState>) -> Option<String> {
+    state.config.recovery_error()
+}
+
+#[tauri::command]
+fn export_settings(state: State<AppState>) -> Result<String, String> {
+    if let Some(error) = state.config.recovery_error() {
+        return Err(error);
+    }
+    serde_json::to_string_pretty(&state.config.get()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn restore_settings(
+    text: Option<String>,
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<String, String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
+    if state.bot.current().is_some() {
+        return Err("请先停止钓鱼，再导入配置或恢复默认值".into());
+    }
+    let mut classifier = state.classifier.write().map_err(|e| e.to_string())?;
+    let mut region = state.search_region.write().map_err(|e| e.to_string())?;
+    let backup = state.config.replace(text.as_deref())?;
+    let settings = state.config.get();
+    *classifier = settings.classifier();
+    *region = None;
+    LOOT_DELAY_MS.store(settings.loot_delay_ms, Ordering::SeqCst);
+    let _ = app.emit("settings-restored", ());
+    let _ = app.emit("bot-status", ());
+    Ok(format!("设置已恢复，原配置备份：{}", backup.display()))
+}
+
+#[tauri::command]
+fn export_diagnostics(state: State<AppState>) -> Result<String, String> {
+    let log = state.file_log.lock().map_err(|e| e.to_string())?;
+    let report = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "status": status(&state),
+        "diagnostics": state.diagnostics.get(),
+        "settings": state.config.get(),
+        "configuration_error": state.config.recovery_error(),
+        "log": log.tail().map_err(|e| e.to_string())?,
+    });
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_search_region(state: State<AppState>) -> Option<Rect> {
-    state.search_region.read().ok().and_then(|r| *r)
+    let bounds = client_bounds(selected_target(&state).ok()?).ok()?;
+    state.config.get().region_for(bounds.width, bounds.height)
 }
 
 /// 颜色配置窗口拖框结果（截屏位图坐标），保存成功后才更新共享区域。
@@ -602,12 +754,22 @@ fn set_search_region(
     y: i32,
     width: i32,
     height: i32,
+    source_width: i32,
+    source_height: i32,
     state: State<AppState>,
 ) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
+    let bounds = client_bounds(selected_target(&state)?).map_err(|e| e.to_string())?;
+    if bounds.width != source_width || bounds.height != source_height {
+        return Err("游戏窗口大小已变化，请重新截图后框选".into());
+    }
     let rect = Rect::new(x, y, width, height);
     config::validate_region(rect)?;
     let mut region = state.search_region.write().map_err(|e| e.to_string())?;
-    state.config.update(|c| c.search_region = Some(rect))?;
+    state.config.update(|c| {
+        c.search_region = Some(rect);
+        c.search_region_size = Some([source_width, source_height]);
+    })?;
     *region = Some(rect);
     tracing::info!("搜索区域已设置: {x},{y} {width}x{height}");
     Ok(())
@@ -615,8 +777,12 @@ fn set_search_region(
 
 #[tauri::command]
 fn clear_search_region(state: State<AppState>) -> Result<(), String> {
+    let _change = state.settings_change.lock().map_err(|e| e.to_string())?;
     let mut region = state.search_region.write().map_err(|e| e.to_string())?;
-    state.config.update(|c| c.search_region = None)?;
+    state.config.update(|c| {
+        c.search_region = None;
+        c.search_region_size = None;
+    })?;
     *region = None;
     tracing::info!("搜索区域已清除（恢复全图搜索）");
     Ok(())
@@ -694,27 +860,40 @@ fn main() {
         })
         .setup(|app| {
             let directory = app.path().app_config_dir()?;
-            let config = ConfigStore::load(&directory, &std::env::current_dir()?)
+            let config = ConfigStore::load_or_recover(&directory, &std::env::current_dir()?)
                 .map_err(std::io::Error::other)?;
             let settings = config.get();
+            LOOT_DELAY_MS.store(settings.loot_delay_ms, Ordering::SeqCst);
+            let file_log =
+                FileLog::new(app.path().app_log_dir()?).map_err(std::io::Error::other)?;
             app.manage(AppState {
-                classifier: Arc::new(RwLock::new(PixelClassifier::new())),
-                search_region: Arc::new(RwLock::new(settings.search_region)),
+                classifier: Arc::new(RwLock::new(settings.classifier())),
+                search_region: Arc::new(RwLock::new(None)),
                 bot: Sessions::default(),
                 config,
                 closing: AtomicBool::new(false),
+                diagnostics: Arc::new(Diagnostics::default()),
+                file_log: std::sync::Mutex::new(file_log),
+                settings_change: std::sync::Mutex::new(()),
+                target: std::sync::Mutex::new(None),
             });
-            // C# MainWindow 构造：pixelClassifier.SetConfiguration(IsWowClassic())
-            {
-                let state = app.state::<AppState>();
-                let mut c = state.classifier.write().unwrap();
-                c.set_configuration(fishing_platform_windows::is_wow_classic());
-            }
 
             // 日志转发到全部窗口
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 while let Ok(line) = log_rx.recv() {
+                    if let Err(error) = handle
+                        .state::<AppState>()
+                        .file_log
+                        .lock()
+                        .map_err(|e| e.to_string())
+                        .and_then(|log| log.append(&format!("{line}\n")).map_err(|e| e.to_string()))
+                    {
+                        handle
+                            .state::<AppState>()
+                            .diagnostics
+                            .error(format!("写入日志失败：{error}"));
+                    }
                     let _ = handle.emit("log", line);
                 }
             });
@@ -746,6 +925,11 @@ fn main() {
             get_search_region,
             set_search_region,
             clear_search_region,
+            get_diagnostics,
+            get_settings_recovery,
+            export_settings,
+            restore_settings,
+            export_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

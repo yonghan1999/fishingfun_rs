@@ -88,6 +88,8 @@ html, body {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-start;
+  max-height: 65vh;
+  overflow-y: auto;
 }
 
 .tool-btn {
@@ -161,6 +163,16 @@ html, body {
 #scheduleMinutes { width: 68px; }
 #scheduleAction { min-width: 120px; }
 #saveSchedule { padding: 2px 8px; }
+
+#runtimeStatus, #diagnosticsPanel { width: calc(100% - 20px); margin: 6px 10px; font-size: 12px; line-height: 1.6; }
+#runtimeStatus { background: #edf6ff; padding: 6px; border-radius: 4px; }
+#diagnosticsPanel summary { cursor: pointer; }
+#diagnosticsPanel p { margin: 5px 0; }
+#recoveryWarning { color: #a00000; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.settings-actions button { padding: 4px 6px; }
+#diagnosticsText { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+#screenshot { max-height: 100%; object-fit: contain; }
 
 /* 按键绑定文本框（KeyBindChooser：FontSize 24、透明、居中） */
 #castKeyInput {

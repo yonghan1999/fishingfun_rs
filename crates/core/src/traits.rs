@@ -84,6 +84,8 @@ pub enum InputError {
     Cancelled,
     #[error("绑定的目标窗口已关闭或不再属于原进程")]
     TargetUnavailable,
+    #[error("游戏窗口位置或大小已改变，请重新开始")]
+    TargetGeometryChanged,
     #[error("目标窗口不在前台，请切回游戏后重新开始")]
     NotForeground,
     #[error("点击位置不属于绑定的目标窗口")]
