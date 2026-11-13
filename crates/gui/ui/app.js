@@ -365,7 +365,7 @@ listen("settings-restored", () => reloadSettings().catch(() => {}));
 window.addEventListener("DOMContentLoaded", () => {
   chart = new AmplitudeChart(el("chartCanvas"));
   fish = new FlyingFish(el("fishLayer"));
-  // C# SizeChanged 防抖后 flipper 最终停在正面 —— 初始即正面，无需动作
+  // 图表和日志默认显示背面的展开按钮，保持用户手动切换后的状态。
   setButtonStates(true);
   syncStatus();
   refreshRecovery().catch(() => {});
